@@ -30,7 +30,7 @@ TRUTH IN ADVERTISING (read this before you run it)
     time (nobody publishes the creator's original allocation). What IS
     implemented: (a) reject if the creator still holds > MAX_CREATOR_HOLD_PCT of
     supply, and (b) remember the creator's balance at entry and emergency-exit
-    if it drops 20% or more while we hold. See CHECK_CREATOR note below.
+    if it drops 20% or more while we hold. See evaluate_safety() / decide_exit().
   * The FOMO app has no public trading API. This bot never calls FOMO. Live
     execution is Jupiter (Solana) through a separate, swappable executor class.
 
