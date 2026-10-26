@@ -1,0 +1,9 @@
+# runtime artifacts produced by meme_agents.py
+trades.csv
+bot.log
+bot.log.*
+final_report.txt
+free_run_report.txt
+STOP
+__pycache__/
+*.pyc
