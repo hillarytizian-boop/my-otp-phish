@@ -19,6 +19,13 @@ and simulates slippage, price impact, network fees, priority fees and ATA rent.
 
 TRUTH IN ADVERTISING (read this before you run it)
 --------------------------------------------------
+  * THERE IS NO SUCH THING AS A SURE SIGNAL in memecoins. What this version does
+    instead: (a) harder entries - momentum >= 70, a real 5m tape (>= 12 trades,
+    >= 6 unique buyers, >= $200 volume), at least 2 independent providers, and a
+    SECOND LOOK 25s later that re-fetches, re-scores and re-runs every filter;
+    (b) 24/7 operation - state.json makes restarts resume, heartbeat.json lets a
+    watchdog see it is alive; (c) self-measurement - `--analyze` reads trades.csv
+    and tells you honestly whether the rules made money (they often do not).
   * NOBODY can sell exactly at the peak. No script can. The trailing stop is the
     best practical approximation: it gives back 10-15% of the top and nothing
     more. Everything else is marketing.
@@ -51,7 +58,20 @@ RUN (paper mode, the default)
 -----------------------------
   python meme_agents.py
   python meme_agents.py --free-run-hours 24      # 24h forward paper test
+  python meme_agents.py --analyze                # did the signals actually pay?
   python meme_agents.py --selftest               # offline test suite, no network
+
+RUNNING IT ALL DAY
+------------------
+  The bot itself never stops (no runtime limit unless you pass one) and saves
+  state.json after every change, so a crash or a dead Termux session costs you
+  nothing but time. Wrap it in a restart loop:
+
+    termux-wake-lock
+    while true; do python meme_agents.py --paper; sleep 10; done
+
+  heartbeat.json is rewritten every dashboard tick; if its timestamp stops
+  moving, the loop is dead. --no-state starts from a clean portfolio.
 
 RUN (live mode - burner wallet only, money you can lose)
 -------------------------------------------------------
@@ -112,7 +132,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # --- well-known Solana mints -------------------------------------------------
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -270,8 +290,18 @@ class Config:
     strict_unknown: bool = True                  # unknown safety data = reject
 
     # ---- momentum -----------------------------------------------------------
-    momentum_threshold: float = 55.0             # 0..100
-    max_5m_pump_pct: float = 40.0                # never chase a +40% 5m candle
+    momentum_threshold: float = 70.0              # 0..100, high-conviction only
+    max_5m_pump_pct: float = 40.0                 # never chase a +40% 5m candle
+
+    # ---- signal quality (this is what "only strong signals" actually means) --
+    min_corroboration: int = 2                    # independent providers with data
+    confirm_delay_s: float = 25.0                 # second look this long after the first
+    confirm_max_drop_pct: float = 5.0             # price must hold within -5% of first look
+    min_unique_buyers_5m: int = 6
+    min_trades_5m: int = 12
+    min_tape_volume_5m_usd: float = 200.0
+    reject_copycats: bool = True
+    max_positions_per_symbol: int = 1
 
     # ---- exits --------------------------------------------------------------
     stop_loss_pct: float = -20.0
@@ -327,6 +357,11 @@ class Config:
     log_file: str = "bot.log"
     stop_file: str = "STOP"
     report_file: str = ""                       # empty = auto name by mode
+    state_file: str = "state.json"              # survives restarts / crashes
+    heartbeat_file: str = "heartbeat.json"
+    heartbeat_every_s: float = 10.0      # for external watchdogs
+    state_enabled: bool = True
+    stale_price_alert_s: float = 300.0
 
     # ---- autonomous paper test ----------------------------------------------
     free_run_hours: float = 0.0                 # >0 = stop after N hours and report
@@ -363,8 +398,8 @@ class Config:
 # =============================================================================
 
 LEDGER_FIELDS = [
-    "ts_utc", "mode", "agent", "event", "mint", "symbol", "side",
-    "qty_tokens", "price_usd", "usd_value", "fee_usd", "pnl_usd",
+    "ts_utc", "mode", "agent", "event", "pos_id", "mint", "symbol", "side",
+    "qty_tokens", "price_usd", "usd_value", "fee_usd", "pnl_usd", "score",
     "reason", "detail",
 ]
 
@@ -398,21 +433,31 @@ class Ledger:
 
     def _ensure_header(self) -> None:
         try:
-            needs = (not os.path.exists(self.path)) or os.path.getsize(self.path) == 0
-            if needs:
-                with open(self.path, "w", newline="", encoding="utf-8") as fh:
-                    csv.writer(fh).writerow(LEDGER_FIELDS)
+            if os.path.exists(self.path) and os.path.getsize(self.path) > 0:
+                with open(self.path, newline="", encoding="utf-8") as fh:
+                    header = next(csv.reader(fh), [])
+                if header == LEDGER_FIELDS:
+                    return
+                # Schema changed: never mix column layouts in one file.
+                backup = "{}.{}.csv".format(
+                    os.path.splitext(self.path)[0], now_utc().strftime("%Y%m%d-%H%M%S"))
+                os.replace(self.path, backup)
+                log.warning("old ledger schema moved to %s", backup)
+            with open(self.path, "w", newline="", encoding="utf-8") as fh:
+                csv.writer(fh).writerow(LEDGER_FIELDS)
         except OSError as exc:                      # read-only storage etc.
             log.error("cannot write ledger %s: %s", self.path, exc)
 
     async def record(self, event: str, agent: str = "system", mint: str = "",
                      symbol: str = "", side: str = "", qty: float = 0.0,
                      price: float = 0.0, usd: float = 0.0, fee_usd: float = 0.0,
-                     pnl_usd: float = 0.0, reason: str = "", detail: str = "") -> None:
-        row = [utc_str(), self.mode, agent, event, mint, symbol, side,
+                     pnl_usd: float = 0.0, reason: str = "", detail: str = "",
+                     pos_id: str = "", score: float = 0.0) -> None:
+        row = [utc_str(), self.mode, agent, event, pos_id, mint, symbol, side,
                "{:.8f}".format(qty) if qty else "", "{:.10g}".format(price) if price else "",
                "{:.6f}".format(usd) if usd else "", "{:.6f}".format(fee_usd) if fee_usd else "",
-               "{:.6f}".format(pnl_usd) if pnl_usd else "", reason, detail[:400]]
+               "{:.6f}".format(pnl_usd) if pnl_usd else "",
+               "{:.1f}".format(score) if score else "", reason, detail[:400]]
         async with self.lock:
             try:
                 with open(self.path, "a", newline="", encoding="utf-8") as fh:
@@ -867,6 +912,7 @@ class Position:
     creator_baseline_raw: float = -1.0
     last_price: float = 0.0
     last_price_ts: float = 0.0
+    decimals: int = 6
     last_facts_ts: float = 0.0
     last_micro_ts: float = 0.0
     snap: Optional[MarketSnapshot] = None
@@ -1114,10 +1160,17 @@ class Sources:
                 best, best_liq = p, liq
         return best
 
+    def snapshot_from_gt(self, mint: str, pool: Dict[str, Any]) -> MarketSnapshot:
+        """Build a snapshot from GeckoTerminal alone (DexScreener may lag)."""
+        snap = MarketSnapshot(mint=mint, source="geckoterminal", ts=time.time())
+        return self.apply_gt_pool(snap, pool)
+
     def apply_gt_pool(self, snap: MarketSnapshot, pool: Dict[str, Any]) -> MarketSnapshot:
         attrs = (pool or {}).get("attributes") or {}
         if not attrs:
             return snap
+        if not snap.symbol:
+            snap.symbol = str(attrs.get("name") or "").split("/")[0].strip()[:24]
         if not snap.pool_address:
             snap.pool_address = str(attrs.get("address") or "")
         if snap.price_usd <= 0:
@@ -1330,9 +1383,93 @@ class Sources:
 # SECTION 7.  SAFETY FILTERS  (pure functions: easy to test, hard to cheat)
 # =============================================================================
 
+# Impersonation and bait patterns. A token whose *symbol* is exactly one of these
+# is not "the" token: it is a copycat dressed as it. Nobody needs a 10-minute-old
+# "USDC" from a $60k pool.
+PROTECTED_SYMBOLS = {
+    "SOL", "WSOL", "USDC", "USDT", "USDG", "USDS", "EURC", "JUP", "JITO", "JTO",
+    "BONK", "WIF", "PYTH", "RAY", "ORCA", "MSOL", "BSOL", "JITOSOL", "INF",
+    "PYUSD", "FDUSD", "DAI", "BTC", "WBTC", "ETH", "WETH", "USDE", "SUSD",
+}
+
+# Classic bait wording found in scam token metadata.
+SCAM_PATTERNS = (
+    "official", "airdrop", "claim", "giveaway", "reward", "verify", "validate",
+    "presale", "whitelist", "t.me", "telegram", "discord.gg", "http://",
+    "https://", ".com", ".xyz", ".io/", "connect wallet", "free ",
+)
+
+# Zero-width / bidi / control characters used to hide a fake ticker.
+_HIDDEN_CHARS = set(range(0x00, 0x20)) | set(range(0x7F, 0xA0)) | \
+    set(range(0x200B, 0x2010)) | set(range(0x202A, 0x202F)) | {0x2060, 0xFEFF}
+
+
+def name_quality(symbol: str, name: str) -> Optional[str]:
+    """
+    Returns a rejection reason, or None when the metadata looks legitimate.
+
+    Cheap, deterministic filters for the most common scam patterns: a token
+    impersonating a major ticker, invisible characters in the name, or metadata
+    that reads like a phishing link.
+    """
+    sym = (symbol or "").strip()
+    nm = (name or "").strip()
+    if not sym:
+        return "empty symbol"
+    if sym.upper() in PROTECTED_SYMBOLS:
+        return "impersonates {} (copycat ticker)".format(sym.upper())
+    if len(sym) > 20:
+        return "symbol too long ({} chars)".format(len(sym))
+    if len(nm) > 48:
+        return "name too long ({} chars)".format(len(nm))
+    for text in (sym, nm):
+        bad = [c for c in text if ord(c) in _HIDDEN_CHARS]
+        if bad:
+            return "hidden/control characters in metadata"
+    haystack = (sym + " " + nm).lower()
+    for pat in SCAM_PATTERNS:
+        if pat in haystack:
+            return "bait text in metadata: {!r}".format(pat)
+    return None
+
+
+def tape_quality(micro: Optional[MicroStats], cfg: Config) -> Optional[str]:
+    """
+    Is there a real, human-sized tape behind the signal?
+
+    A ratio of "3 buys / 0 sells" is meaningless; a minimum number of
+    transactions, unique wallets and dollar volume is not. This is the check that
+    stops the bot buying a token with a beautiful score and $11 of volume.
+    """
+    if micro is None or micro.trades_seen <= 0:
+        return "no trade tape available"
+    if micro.total_5m < cfg.min_trades_5m:
+        return "only {} trades in 5m (min {})".format(micro.total_5m, cfg.min_trades_5m)
+    if micro.buyers_5m < cfg.min_unique_buyers_5m:
+        return "{} unique buyers in 5m (min {})".format(micro.buyers_5m,
+                                                        cfg.min_unique_buyers_5m)
+    vol = micro.buy_vol_5m + micro.sell_vol_5m
+    if vol < cfg.min_tape_volume_5m_usd:
+        return "5m volume {} (min {})".format(fmt_usd(vol), fmt_usd(cfg.min_tape_volume_5m_usd))
+    return None
+
+
+def confirmation_verdict(first_price: float, now_price: float, score: float,
+                         cfg: Config) -> Optional[str]:
+    """Second-look verdict. Returns a rejection reason, or None if it still qualifies."""
+    if now_price <= 0:
+        return "confirm_no_price"
+    if first_price > 0 and now_price < first_price * (1.0 - cfg.confirm_max_drop_pct / 100.0):
+        return "confirm_price_dropped {:.1f}%".format((now_price / first_price - 1.0) * 100.0)
+    if score < cfg.momentum_threshold:
+        return "confirm_momentum_lost ({:.1f} < {:.1f})".format(score, cfg.momentum_threshold)
+    return None
+
+
 def evaluate_safety(snap: Optional[MarketSnapshot], facts: Optional[TokenFacts],
                     sell_quote: Optional[Dict[str, Any]], cfg: Config,
-                    now: Optional[float] = None) -> SafetyResult:
+                    now: Optional[float] = None,
+                    providers: Optional[int] = None) -> SafetyResult:
     now = now or time.time()
     checks: List[Check] = []
 
@@ -1342,6 +1479,10 @@ def evaluate_safety(snap: Optional[MarketSnapshot], facts: Optional[TokenFacts],
     if snap is None:
         add("market", False, "no DexScreener/GeckoTerminal pair data")
     else:
+        # Copycats: a convincing ticker is the cheapest scam there is.
+        if cfg.reject_copycats:
+            bad = name_quality(snap.symbol or (facts.symbol if facts else ""), snap.name)
+            add("name_quality", bad is None, bad or "symbol/name clean: {}".format(snap.symbol))
         age = snap.age_minutes(now)
         add("age_min", None if age < 0 else age >= cfg.min_token_age_min,
             "pair age {}m (min {})".format("{:.1f}".format(age) if age >= 0 else "?", cfg.min_token_age_min))
@@ -1393,6 +1534,12 @@ def evaluate_safety(snap: Optional[MarketSnapshot], facts: Optional[TokenFacts],
         if cfg.reject_on_rugcheck_danger:
             add("rug_danger", not facts.danger_risks,
                 "danger flags: {}".format(", ".join(facts.danger_risks[:4]) or "none"))
+
+    # Independent corroboration: one provider can be wrong, late, or lying.
+    prov = providers if providers is not None else \
+        ((1 if snap else 0) + (1 if facts is not None and facts.available else 0))
+    add("corroboration", prov >= cfg.min_corroboration,
+        "{}/3 providers returned data (min {})".format(prov, cfg.min_corroboration))
 
     # honeypot sign #2: a real $2 sell route must exist and not be a cliff
     if sell_quote is None:
@@ -1707,14 +1854,19 @@ class RiskManager:
                 self.halt_until_day = ""
 
     # -- entries -----------------------------------------------------------
-    async def can_open(self, mint: str) -> Tuple[bool, str]:
+    async def can_open(self, mint: str, symbol: str = "") -> Tuple[bool, str]:
         async with self.lock:
             self.rollover()
             if self.halted:
                 return False, "halted: {}".format(self.halt_reason or "risk manager")
-            open_mints = self.pf.open_mints()
+            open_positions = self.pf.open_positions()
+            open_mints = {p.mint for p in open_positions}
             if mint in open_mints:
                 return False, "already_open (never average down)"
+            if symbol:
+                same = sum(1 for p in open_positions if p.symbol.upper() == symbol.upper())
+                if same >= self.cfg.max_positions_per_symbol:
+                    return False, "clone guard: {!r} already open".format(symbol)
             if len(open_mints) >= self.cfg.max_open_positions:
                 return False, "max_positions {} reached".format(self.cfg.max_open_positions)
             until = self.cooldowns.get(mint, 0.0)
@@ -2206,11 +2358,13 @@ class Swarm:
         self.feed_state = {name: {"last": 0.0, "lock": asyncio.Lock(), "ok": 0, "err": 0,
                                   "last_err": ""} for name, _ in FEEDS}
         self.entry_lock = asyncio.Lock()
+        self.pending: Dict[str, Dict[str, Any]] = {}      # mint -> awaiting 2nd look
         self.reject_counts: Dict[str, int] = {}
         self.entries = 0
         self.sells = 0
         self.recent_events: List[str] = []
         self.report_written = False
+        self._alerted: Dict[str, float] = {}
 
     # ------------------------------------------------------------------ helper
     def note(self, text: str) -> None:
@@ -2245,6 +2399,11 @@ class Swarm:
             "trail {:.0f}%->{:.0f}%".format(
                 self.cfg.stop_loss_pct, self.cfg.tp1_pct, self.cfg.tp1_frac * 100,
                 self.cfg.tp2_pct, self.cfg.tp2_frac * 100, self.cfg.trail_pct, self.cfg.trail_tight_pct),
+            " signal quality   : momentum>={:.0f} | {}+ providers | 2nd look after {:.0f}s | "
+            "tape>={} trades, {} buyers, {} volume".format(
+                self.cfg.momentum_threshold, self.cfg.min_corroboration,
+                self.cfg.confirm_delay_s, self.cfg.min_trades_5m,
+                self.cfg.min_unique_buyers_5m, fmt_usd(self.cfg.min_tape_volume_5m_usd)),
             " risk             : daily loss stop {} | slippage caps {}/{} bps | kill: Ctrl+C or "
             "create file '{}'".format(fmt_usd(self.cfg.daily_loss_limit_usd),
                                       self.cfg.entry_slip_cap_bps, self.cfg.emergency_slip_cap_bps,
@@ -2256,8 +2415,9 @@ class Swarm:
         lines += [
             "-" * 78,
             " files            : {} / {}".format(self.cfg.ledger_csv, self.cfg.log_file),
-            " honest note      : most meme coins go to zero; you can lose the",
-            "                    whole {}.".format(fmt_usd(self.cfg.start_capital_usd)),
+            " honest note      : these are high-conviction entries, NOT sure signals.",
+            "                    No such thing exists. Most meme coins go to zero;",
+            "                    you can lose the whole {}.".format(fmt_usd(self.cfg.start_capital_usd)),
             "=" * 78,
         ]
         for line in lines:
@@ -2355,23 +2515,29 @@ class Swarm:
             mint = cand["mint"]
             try:
                 snap = await self.sources.dexscreener_snapshot(mint)
+                pool = None
+                try:
+                    pool = await self.sources.geckoterminal_pool_for_token(mint)
+                except HttpError:
+                    pool = None
                 if snap is not None:
-                    try:
-                        pool = await self.sources.geckoterminal_pool_for_token(mint)
-                        if pool:
-                            snap = self.sources.apply_gt_pool(snap, pool)
-                    except HttpError:
-                        pass
+                    if pool:
+                        snap = self.sources.apply_gt_pool(snap, pool)
+                elif pool:
+                    snap = self.sources.snapshot_from_gt(mint, pool)
                 facts = await self.sources.rugcheck_facts(mint)
                 price = snap.price_usd if snap else 0.0
                 sell_quote = await self.simulate_sell_quote(mint, price, facts)
-                result = evaluate_safety(snap, facts, sell_quote, self.cfg)
+                providers = ((1 if snap is not None else 0) + (1 if pool else 0) +
+                             (1 if facts.available else 0))
+                result = evaluate_safety(snap, facts, sell_quote, self.cfg,
+                                         providers=providers)
                 symbol = (snap.symbol if snap else "") or facts.symbol or short_addr(mint)
                 if not result.passed:
                     self.count_reject(result.reasons)
                     await self.ledger.record(
                         "REJECT", agent=agent, mint=mint, symbol=symbol,
-                        reason="; ".join(result.reasons)[:300],
+                        reason=clip_reason(result.reasons),
                         detail=result.line())
                     self.note("REJECT {} {}".format(symbol, result.reasons[0].split(":")[0]
                                                     if result.reasons else "?"))
@@ -2422,23 +2588,140 @@ class Swarm:
                         "REJECT", agent=agent, mint=mint, symbol=item["symbol"],
                         reason="momentum {:.1f} < threshold {:.1f}".format(
                             res.score, self.cfg.momentum_threshold),
+                        detail=" ".join("{}={:.0f}".format(k, v) for k, v in res.components.items()),
+                        score=res.score)
+                    self.blocked[mint] = time.time() + self.cfg.cooldown_after_reject_s
+                    continue
+                # A high score on a dead tape is noise, not a signal.
+                bad_tape = tape_quality(micro, self.cfg)
+                if bad_tape:
+                    self.count_reject(["tape_quality"])
+                    await self.ledger.record(
+                        "REJECT", agent=agent, mint=mint, symbol=item["symbol"],
+                        reason="tape: " + bad_tape, score=res.score,
                         detail=" ".join("{}={:.0f}".format(k, v) for k, v in res.components.items()))
                     self.blocked[mint] = time.time() + self.cfg.cooldown_after_reject_s
                     continue
+                # Park it. Nothing is bought on a single observation: a second,
+                # independent look runs confirm_delay_s later in confirmation_loop.
+                price = snap.price_usd if snap else 0.0
+                if len(self.pending) >= 300:
+                    log.debug("confirmation queue full, dropping %s", short_addr(mint))
+                    continue
+                self.pending[mint] = {
+                    "due": time.time() + self.cfg.confirm_delay_s,
+                    "first_seen": time.time(), "price": price, "score": res.score,
+                    "components": res.components, "item": item, "agent": agent,
+                }
                 await self.ledger.record(
-                    "SIGNAL", agent=agent, mint=mint, symbol=item["symbol"],
-                    price=snap.price_usd if snap else 0.0, reason="momentum {:.1f}".format(res.score),
-                    detail=" ".join("{}={:.0f}".format(k, v) for k, v in res.components.items()))
-                self.note("SIGNAL {} momentum {:.0f}".format(item["symbol"], res.score))
-                await self.signals.put({"mint": mint, "symbol": item["symbol"], "snap": snap,
-                                        "facts": facts, "micro": micro, "score": res.score,
-                                        "source": item["source"], "agent": agent,
-                                        "ts": time.time()})
+                    "AWAIT_CONFIRM", agent=agent, mint=mint, symbol=item["symbol"],
+                    price=price, reason="momentum {:.1f}, second look in {:.0f}s".format(
+                        res.score, self.cfg.confirm_delay_s),
+                    detail=" ".join("{}={:.0f}".format(k, v) for k, v in res.components.items()),
+                    score=res.score)
+                self.note("WATCH {} {:.0f}".format(item["symbol"], res.score))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.error("%s crashed on %s: %s", agent, short_addr(mint), exc)
                 log.debug("%s", traceback.format_exc())
+
+    # ------------------------------------------------------------ confirmation
+    async def _confirm_candidate(self, mint: str, entry: Dict[str, Any]) -> None:
+        """
+        Independent second look. Re-fetches the market, re-scores momentum, re-runs
+        every safety filter and only then forwards a signal to the executors.
+        This is the closest thing to a "high conviction" signal that data supports:
+        the setup must still be true seconds later, on fresh data, from a second
+        provider call - not just once in a snapshot.
+        """
+        agent = entry.get("agent", "confirm")
+        item = entry["item"]
+        symbol = item.get("symbol", "") or short_addr(mint)
+        now = time.time()
+
+        snap = await self.sources.dexscreener_snapshot(mint)
+        pool = None
+        try:
+            pool = await self.sources.geckoterminal_pool_for_token(mint)
+        except HttpError:
+            pool = None
+        if snap is not None and pool:
+            snap = self.sources.apply_gt_pool(snap, pool)
+        elif snap is None and pool:
+            snap = self.sources.snapshot_from_gt(mint, pool)
+        if snap is None or snap.price_usd <= 0:
+            await self._confirm_reject(mint, symbol, "confirm_no_price", agent)
+            return
+
+        micro = await self.sources.geckoterminal_micro(snap.pool_address) if snap.pool_address else None
+        res = momentum_score(snap, micro, self.cfg)
+        verdict = confirmation_verdict(entry["price"], snap.price_usd, res.score, self.cfg)
+        if verdict is None:
+            bad = tape_quality(micro, self.cfg)
+            if bad:
+                verdict = "confirm_tape: " + bad
+        if verdict is None and res.veto:
+            verdict = "confirm_veto: " + res.veto
+        if verdict is None:
+            facts = await self.sources.rugcheck_facts(mint)
+            sell_quote = await self.simulate_sell_quote(mint, snap.price_usd, facts)
+            providers = ((1 if snap is not None else 0) + (1 if pool else 0) +
+                         (1 if facts.available else 0))
+            result = evaluate_safety(snap, facts, sell_quote, self.cfg, providers=providers)
+            if not result.passed:
+                await self._confirm_reject(mint, symbol, "confirm_safety: " + "; ".join(result.reasons),
+                                           agent)
+                return
+        else:
+            facts = item.get("facts")
+        if verdict:
+            await self._confirm_reject(mint, symbol, verdict, agent)
+            return
+
+        if self.draining or self.stop_event.is_set():
+            return
+        await self.ledger.record(
+            "SIGNAL", agent=agent, mint=mint, symbol=symbol, price=snap.price_usd,
+            reason="confirmed after {:.0f}s".format(now - entry["first_seen"]),
+            detail="momentum {:.1f} (first {:.1f}) | held {:.0f}s | {}".format(
+                res.score, entry["score"], now - entry["first_seen"],
+                " ".join("{}={:.0f}".format(k, v) for k, v in res.components.items())),
+            score=res.score)
+        self.note("SIGNAL {} {:.0f} (confirmed)".format(symbol, res.score))
+        await self.signals.put({"mint": mint, "symbol": symbol, "snap": snap, "facts": facts,
+                                "micro": micro, "score": res.score,
+                                "source": item.get("source", ""), "agent": agent,
+                                "ts": time.time()})
+
+    async def _confirm_reject(self, mint: str, symbol: str, reason: str, agent: str) -> None:
+        self.count_reject([reason])
+        await self.ledger.record("REJECT", agent=agent, mint=mint, symbol=symbol,
+                                 reason="second look: " + reason[:280])
+        self.note("DROP {} {}".format(symbol, reason.split(":")[0]))
+        self.blocked[mint] = time.time() + self.cfg.cooldown_after_reject_s
+
+    async def confirmation_loop(self) -> None:
+        while not self.stop_event.is_set():
+            now = time.time()
+            for mint, entry in list(self.pending.items()):
+                if entry["due"] > now:
+                    continue
+                self.pending.pop(mint, None)
+                if self.draining or mint in self.pf.open_mints():
+                    continue
+                try:
+                    await self._confirm_candidate(mint, entry)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.error("confirmation failed for %s: %s", short_addr(mint), exc)
+                    log.debug("%s", traceback.format_exc())
+            if len(self.pending) > 0:                     # expire stale first looks
+                for mint, entry in list(self.pending.items()):
+                    if now - entry["first_seen"] > 600:
+                        self.pending.pop(mint, None)
+            await self._sleep(2.0)
 
     # ------------------------------------------------------------------ entries
     async def try_open(self, sig: Dict[str, Any], agent: str) -> None:
@@ -2447,7 +2730,7 @@ class Swarm:
         async with self.entry_lock:                   # one wallet = one entry at a time
             if self.draining or self.stop_event.is_set():
                 return
-            ok, why = await self.risk.can_open(mint)
+            ok, why = await self.risk.can_open(mint, symbol)
             if not ok:
                 await self.risk.on_reject(mint, why)
                 await self.ledger.record("VETO", agent=agent, mint=mint, symbol=symbol,
@@ -2485,6 +2768,7 @@ class Swarm:
                                    .format("LIVE" if self.cfg.live else "PAPER", symbol, fill.error))
                 return
             pos = await self.pf.buy_fill(mint, symbol, fill, snap, agent, sig.get("source", ""), facts)
+            pos.decimals = decimals
             pos.micro = sig.get("micro")
             pos.last_micro_ts = time.time()
             pos.last_facts_ts = time.time()
@@ -2493,6 +2777,7 @@ class Swarm:
             await self.ledger.record(
                 "BUY", agent=agent, mint=mint, symbol=symbol, side="buy",
                 qty=fill.qty_tokens, price=fill.price, usd=fill.usd_value, fee_usd=fill.fee_usd,
+                pos_id=pos.pos_id, score=fnum(sig.get("score")),
                 reason="momentum {:.0f}".format(fnum(sig.get("score"))),
                 detail="slippage {:.0f}bps; {}".format(fill.slippage_bps, fill.detail))
             self.tg.notify("[{}] BUY {} ${:.2f} @ {:.10g}\nmomentum {:.0f} | liq {}\n{}"
@@ -2500,6 +2785,7 @@ class Swarm:
                                    fill.usd_value, fill.price, fnum(sig.get("score")),
                                    fmt_usd(snap.liquidity_usd), short_addr(mint)))
             self.note("BUY {} ${:.2f}".format(symbol, fill.usd_value))
+            await self.save_state()
 
     # ------------------------------------------------------------------ exits
     async def claim_position(self) -> Optional[Position]:
@@ -2533,6 +2819,7 @@ class Swarm:
             facts = await self.sources.rugcheck_facts(pos.mint)
             if facts and facts.available:
                 pos.facts = facts
+                pos.decimals = facts.decimals
                 pos.last_facts_ts = now
 
     async def manage_position(self, pos: Position, agent: str) -> None:
@@ -2543,7 +2830,7 @@ class Swarm:
             if decision is None:
                 return
             price = (snap.price_usd if snap and snap.price_usd > 0 else pos.last_price)
-            decimals = pos.facts.decimals if pos.facts else self.cfg.fallback_token_decimals
+            decimals = pos.facts.decimals if pos.facts else pos.decimals
             liq = snap.liquidity_usd if snap else pos.entry_liquidity_usd
             fill = await self.executor.sell(pos, decision.qty, price, decimals, liq,
                                             decision.emergency)
@@ -2564,7 +2851,8 @@ class Swarm:
             await self.ledger.record(
                 event, agent=agent, mint=pos.mint, symbol=pos.symbol, side="sell",
                 qty=fill.qty_tokens, price=fill.price, usd=fill.usd_value, fee_usd=fill.fee_usd,
-                pnl_usd=pnl, reason="{}: {}".format(decision.kind, decision.reason),
+                pnl_usd=pnl, pos_id=pos.pos_id,
+                reason="{}: {}".format(decision.kind, decision.reason),
                 detail=fill.detail)
             self.tg.notify("[{}] SELL {}\n{}\n${:.2f} -> pnl ${:+.2f}"
                            .format("LIVE" if self.cfg.live else "PAPER", pos.symbol,
@@ -2578,8 +2866,10 @@ class Swarm:
                 total = pos.realized_usd
                 await self.pf.close_position(pos, "{}: {}".format(decision.kind, decision.reason))
                 await self.ledger.record("CLOSE", agent=agent, mint=pos.mint, symbol=pos.symbol,
-                                         pnl_usd=total, reason=pos.exit_reason)
+                                         pnl_usd=total, pos_id=pos.pos_id,
+                                         reason=pos.exit_reason)
                 self.note("CLOSE {} pnl ${:+.2f}".format(pos.symbol, total))
+                await self.save_state()
         finally:
             pos.locked = False
 
@@ -2643,6 +2933,150 @@ class Swarm:
                 self.draining = True
             await asyncio.sleep(self.cfg.risk_poll_s)
 
+    # ------------------------------------------------------------- persistence
+    def _write_json(self, path: str, data: Dict[str, Any]) -> bool:
+        """Atomic JSON write: a phone can be killed mid-write at any time."""
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=1, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            return True
+        except OSError as exc:
+            log.error("cannot write %s: %s", path, exc)
+            return False
+
+    def _position_state(self, p: Position) -> Dict[str, Any]:
+        return {
+            "pos_id": p.pos_id, "mint": p.mint, "symbol": p.symbol,
+            "opened_ts": p.opened_ts, "entry_price": p.entry_price,
+            "entry_cost_usd": p.entry_cost_usd, "initial_tokens": p.initial_tokens,
+            "tokens": p.tokens, "peak_price": p.peak_price, "peak_ts": p.peak_ts,
+            "entry_fee_usd": p.entry_fee_usd, "realized_usd": p.realized_usd,
+            "fees_usd": p.fees_usd, "tp1_done": p.tp1_done, "tp2_done": p.tp2_done,
+            "trail_active": p.trail_active, "entry_liquidity_usd": p.entry_liquidity_usd,
+            "creator_baseline_raw": p.creator_baseline_raw, "last_price": p.last_price,
+            "last_price_ts": p.last_price_ts, "decimals": p.decimals,
+            "source": p.source,
+        }
+
+    async def save_state(self) -> None:
+        """Snapshot cash, positions and risk counters so a restart loses nothing."""
+        if not self.cfg.state_enabled:
+            return
+        now = time.time()
+        data = {
+            "version": 1,
+            "mode": "live" if self.cfg.live else "paper",
+            "saved_at_utc": utc_str(),
+            "portfolio": {
+                "cash_usd": self.pf.cash_usd, "realized_usd": self.pf.realized_usd,
+                "fees_usd": self.pf.fees_usd, "wins": self.pf.wins,
+                "losses": self.pf.losses, "trades": self.pf.trades,
+                "start_capital_usd": self.pf.start_capital_usd,
+            },
+            "risk": {
+                "day": self.risk.day, "daily_realized_usd": self.risk.daily_realized_usd,
+                "halted": self.risk.halted, "halt_reason": self.risk.halt_reason,
+                "halt_until_day": self.risk.halt_until_day,
+                "cooldowns": {k: v for k, v in self.risk.cooldowns.items() if v > now},
+            },
+            "positions": [self._position_state(p) for p in self.pf.open_positions()],
+            "reject_counts": dict(sorted(self.reject_counts.items(), key=lambda kv: -kv[1])[:60]),
+        }
+        self._write_json(self.cfg.state_file, data)
+
+    async def load_state(self) -> bool:
+        if not self.cfg.state_enabled or not os.path.exists(self.cfg.state_file):
+            return False
+        try:
+            with open(self.cfg.state_file, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            log.warning("state file unreadable (%s); starting fresh", exc)
+            return False
+        if not isinstance(data, dict):
+            return False
+        mode = "live" if self.cfg.live else "paper"
+        if data.get("mode") != mode:
+            log.warning("state file is from %s mode, current mode is %s - ignoring it",
+                        data.get("mode"), mode)
+            return False
+        pf = data.get("portfolio") or {}
+        self.pf.cash_usd = fnum(pf.get("cash_usd"), self.pf.cash_usd)
+        self.pf.realized_usd = fnum(pf.get("realized_usd"))
+        self.pf.fees_usd = fnum(pf.get("fees_usd"))
+        self.pf.wins = int(fnum(pf.get("wins")))
+        self.pf.losses = int(fnum(pf.get("losses")))
+        self.pf.trades = int(fnum(pf.get("trades")))
+        self.pf.start_capital_usd = fnum(pf.get("start_capital_usd"), self.pf.start_capital_usd)
+        risk = data.get("risk") or {}
+        self.risk.day = str(risk.get("day") or self.risk.day)
+        self.risk.daily_realized_usd = fnum(risk.get("daily_realized_usd"))
+        self.risk.halted = bool(risk.get("halted"))
+        self.risk.halt_reason = str(risk.get("halt_reason") or "")
+        self.risk.halt_until_day = str(risk.get("halt_until_day") or "")
+        for k, v in (risk.get("cooldowns") or {}).items():
+            if fnum(v) > time.time():
+                self.risk.cooldowns[k] = fnum(v)
+        self.reject_counts = {str(k): int(fnum(v)) for k, v in
+                              (data.get("reject_counts") or {}).items()}
+        restored = 0
+        for d in data.get("positions") or []:
+            try:
+                if fnum(d.get("tokens")) <= 0 or fnum(d.get("entry_price")) <= 0:
+                    continue
+                pos = Position(
+                    pos_id=str(d.get("pos_id") or "restored-{}".format(restored)),
+                    mint=str(d["mint"]), symbol=str(d.get("symbol") or ""),
+                    opened_ts=fnum(d.get("opened_ts"), time.time()),
+                    entry_price=fnum(d.get("entry_price")),
+                    entry_cost_usd=fnum(d.get("entry_cost_usd")),
+                    initial_tokens=fnum(d.get("initial_tokens")),
+                    tokens=fnum(d.get("tokens")),
+                    peak_price=fnum(d.get("peak_price"), fnum(d.get("entry_price"))),
+                    peak_ts=fnum(d.get("peak_ts"), time.time()),
+                    entry_fee_usd=fnum(d.get("entry_fee_usd")),
+                    realized_usd=fnum(d.get("realized_usd")),
+                    fees_usd=fnum(d.get("fees_usd")),
+                    tp1_done=bool(d.get("tp1_done")), tp2_done=bool(d.get("tp2_done")),
+                    trail_active=bool(d.get("trail_active")),
+                    entry_liquidity_usd=fnum(d.get("entry_liquidity_usd")),
+                    creator_baseline_raw=fnum(d.get("creator_baseline_raw"), -1.0),
+                    last_price=fnum(d.get("last_price")),
+                    last_price_ts=fnum(d.get("last_price_ts")),
+                    decimals=int(fnum(d.get("decimals"), self.cfg.fallback_token_decimals)),
+                    source=str(d.get("source") or ""), agent="restored",
+                )
+                self.pf.positions[pos.pos_id] = pos
+                restored += 1
+            except (KeyError, TypeError, ValueError) as exc:
+                log.warning("skipping unreadable position in state: %s", exc)
+        log.info("state restored: cash %s, %d open position(s), daily pnl %s",
+                 fmt_usd(self.pf.cash_usd), restored, fmt_usd(self.risk.daily_realized_usd))
+        return True
+
+    async def reconcile_live(self) -> None:
+        """After a restart, trust the chain, not the JSON file."""
+        if not isinstance(self.executor, JupiterExecutor):
+            return
+        for pos in list(self.pf.open_positions()):
+            try:
+                raw = await self.executor.token_balance_raw(pos.mint)
+            except Exception as exc:                      # noqa: BLE001 - never block startup
+                log.warning("could not reconcile %s: %s", pos.symbol, exc)
+                continue
+            if raw <= 0:
+                log.warning("restored position %s has no tokens on chain; closing it",
+                            pos.symbol)
+                await self.pf.close_position(pos, "restored_flat")
+                continue
+            pos.tokens = raw / float(10 ** pos.decimals)
+            log.info("reconciled %s: %.6f tokens on chain", pos.symbol, pos.tokens)
+        await self.save_state()
+
     # ------------------------------------------------------------------ dashboard
     def dashboard(self) -> str:
         now = time.time()
@@ -2694,6 +3128,58 @@ class Swarm:
         lines.append("=" * 96)
         return "\n".join(lines)
 
+    def _write_heartbeat(self) -> None:
+        """External watchdogs (and you, the next morning) can tell it is alive."""
+        st = self.http.stats
+        self._write_json(self.cfg.heartbeat_file, {
+            "ts_utc": utc_str(), "epoch": time.time(),
+            "mode": "live" if self.cfg.live else "paper",
+            "equity_usd": round(self.pf.equity(), 6),
+            "cash_usd": round(self.pf.cash_usd, 6),
+            "realized_usd": round(self.pf.realized_usd, 6),
+            "open_positions": len(self.pf.open_positions()),
+            "trades": self.pf.trades, "wins": self.pf.wins, "losses": self.pf.losses,
+            "daily_loss_used_usd": round(self.risk.daily_loss_used(), 6),
+            "halted": self.risk.halted,
+            "awaiting_confirmation": len(self.pending),
+            "http": {"requests": st.requests, "errors_net": st.errors_net,
+                     "errors_4xx": st.errors_4xx, "errors_5xx": st.errors_5xx,
+                     "retries": st.retries},
+            "feeds": {n: {"ok": v["ok"], "err": v["err"], "last": round(v["last"], 1)}
+                      for n, v in self.feed_state.items()},
+        })
+
+    async def heartbeat_loop(self) -> None:
+        """Independent of the dashboard: a watchdog needs a steady pulse."""
+        while not self.stop_event.is_set():
+            try:
+                self._write_heartbeat()
+            except Exception as exc:
+                log.debug("heartbeat error: %s", exc)
+            await self._sleep(self.cfg.heartbeat_every_s)
+        try:
+            self._write_heartbeat()
+        except Exception:
+            pass
+
+    async def check_stale_prices(self, now: Optional[float] = None) -> None:
+        """
+        A position we cannot price is a position we cannot exit. Say so, loudly,
+        once every ten minutes - silently holding a blind position is how accounts die.
+        """
+        now = now or time.time()
+        for pos in self.pf.open_positions():
+            if now - pos.last_price_ts < self.cfg.stale_price_alert_s:
+                continue
+            if now - self._alerted.get(pos.mint, 0.0) < 600:
+                continue
+            self._alerted[pos.mint] = now
+            msg = "no price for %s in %.0fs - exits may be blind" % (
+                pos.symbol, now - pos.last_price_ts)
+            log.warning("STALE: %s", msg)
+            self.tg.notify("[{}] STALE PRICE: {}".format(
+                "LIVE" if self.cfg.live else "PAPER", msg))
+
     async def dashboard_loop(self) -> None:
         while not self.stop_event.is_set():
             await self._sleep(self.cfg.dashboard_every_s)
@@ -2701,6 +3187,8 @@ class Swarm:
                 return
             try:
                 print(self.dashboard())
+                await self.check_stale_prices()
+                await self.save_state()
             except Exception as exc:
                 log.debug("dashboard error: %s", exc)
 
@@ -2721,6 +3209,7 @@ class Swarm:
         except Exception as exc:
             log.error("close_all failed: %s", exc)
             log.debug("%s", traceback.format_exc())
+        await self.save_state()
         self.stop_event.set()
 
     async def close_all(self, reason: str) -> None:
@@ -2755,6 +3244,7 @@ class Swarm:
         if left:
             log.error("%d position(s) could not be closed - check the wallet manually: %s",
                       len(left), ", ".join(p.symbol for p in left))
+        await self.save_state()
 
     async def _close_one(self, pos: Position, reason: str) -> None:
         snap = None
@@ -2763,7 +3253,7 @@ class Swarm:
         except (asyncio.TimeoutError, HttpError):
             snap = pos.snap
         price = (snap.price_usd if snap and snap.price_usd > 0 else pos.last_price)
-        decimals = pos.facts.decimals if pos.facts else self.cfg.fallback_token_decimals
+        decimals = pos.facts.decimals if pos.facts else pos.decimals
         liq = snap.liquidity_usd if snap else pos.entry_liquidity_usd
         fill = await self.executor.sell(pos, pos.tokens, price, decimals, liq, True)
         if not fill.ok:
@@ -2780,7 +3270,7 @@ class Swarm:
                                  reason=reason, detail=fill.detail)
         await self.pf.close_position(pos, reason)
         await self.ledger.record("CLOSE", agent="risk", mint=pos.mint, symbol=pos.symbol,
-                                 pnl_usd=pos.realized_usd, reason=reason)
+                                 pnl_usd=pos.realized_usd, pos_id=pos.pos_id, reason=reason)
         self.note("CLOSE {} pnl ${:+.2f}".format(pos.symbol, pos.realized_usd))
         self.tg.notify("[{}] CLOSE {} (${:+.2f}) - {}"
                        .format("LIVE" if self.cfg.live else "PAPER", pos.symbol,
@@ -2880,6 +3370,11 @@ class Swarm:
     async def run(self) -> None:
         self.banner()
         await self.executor.startup_checks()
+        if await self.load_state():
+            if self.cfg.live:
+                await self.reconcile_live()
+            log.info("resumed from %s (%d open position(s))", self.cfg.state_file,
+                     len(self.pf.open_positions()))
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -2898,17 +3393,26 @@ class Swarm:
             self.tasks.append(asyncio.create_task(self.executor_worker(i), name="executor{}".format(i)))
         for _ in range(self.counts["risk"]):
             self.tasks.append(asyncio.create_task(self.risk_worker(), name="risk"))
+        self.tasks.append(asyncio.create_task(self.confirmation_loop(), name="confirm"))
+        self.tasks.append(asyncio.create_task(self.heartbeat_loop(), name="heartbeat"))
         self.tasks.append(asyncio.create_task(self.dashboard_loop(), name="dashboard"))
         self.tasks.append(asyncio.create_task(self.tg.sender_loop(self.stop_event), name="telegram"))
 
-        log.info("%d agents running + dashboard/telegram tasks (Ctrl+C to stop)",
-                 sum(self.counts.values()))
+        log.info("%d agents running + confirmation/dashboard/telegram tasks "
+                 "(Ctrl+C to stop)", sum(self.counts.values()))
         await self.stop_event.wait()
         self.draining = True
         await self._stop_tasks()
+        await self.save_state()
 
         text = self.report("stopped")
         print(text)
+        if self.cfg.free_run_hours or self.cfg.max_runtime_hours:
+            try:
+                quality, _ = analyze_ledger(self.cfg.ledger_csv, self.cfg.start_capital_usd)
+                print(quality)
+            except Exception as exc:                  # never fail shutdown over a report
+                log.debug("analyzer failed: %s", exc)
         path = self.save_report(text)
         log.info("report written to %s", path)
 
@@ -2950,6 +3454,12 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[Config, argparse
     p.add_argument("--ledger", default=None, help="CSV path")
     p.add_argument("--log-file", default=None, help="log path")
     p.add_argument("--cg-key", default="", help="optional CoinGecko API key for /coins/list/new")
+    p.add_argument("--analyze", nargs="?", const="__auto__", default=None, metavar="CSV",
+                   help="read trades.csv, print signal quality stats and exit "
+                        "(no arg = the default ledger path)")
+    p.add_argument("--state", default=None, help="state file path (default state.json)")
+    p.add_argument("--no-state", action="store_true",
+                   help="do not save/restore state (fresh start every launch)")
     p.add_argument("--selftest", action="store_true", help="offline test suite, no network, exit")
     p.add_argument("--version", action="version", version="meme_agents {}".format(VERSION))
     args = p.parse_args(argv)
@@ -2978,6 +3488,10 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[Config, argparse
         cfg.log_file = args.log_file
     if args.cg_key:
         cfg.cg_api_key = args.cg_key
+    if args.state:
+        cfg.state_file = args.state
+    if args.no_state:
+        cfg.state_enabled = False
     if args.live and args.paper:
         p.error("--paper and --live are mutually exclusive")
     cfg.live = bool(args.live)
@@ -3404,6 +3918,54 @@ def run_selftest() -> int:
     check("rugged flag rejected", not crash.passed and any("rugged" in r for r in crash.reasons),
           str(crash.reasons))
 
+    # ---------- 1b. signal quality: copycats, tape, second look ------------
+    check("copycat ticker rejected", name_quality("USDC", "USD Coin") is not None,
+          str(name_quality("USDC", "USD Coin")))
+    check("hidden character in symbol rejected",
+          name_quality("TEST\u200b", "Test") is not None)
+    check("bait text rejected",
+          name_quality("CLAIM", "claim your airdrop now") is not None)
+    check("clean metadata accepted", name_quality("BONK2", "Bonk Two") is None,
+          str(name_quality("BONK2", "Bonk Two")))
+    copy_snap = _mk_snap(GOOD)
+    copy_snap.symbol, copy_snap.name = "USDC", "USD Coin"
+    copy = evaluate_safety(copy_snap, _mk_facts(GOOD), {"priceImpactPct": "0.004"}, cfg,
+                           providers=3)
+    check("copycat blocked by the safety filter",
+          not copy.passed and any("name_quality" in r for r in copy.reasons), str(copy.reasons))
+
+    one_prov = evaluate_safety(_mk_snap(GOOD), _mk_facts(GOOD), {"priceImpactPct": "0.004"},
+                               cfg, providers=1)
+    check("single-provider evidence rejected",
+          not one_prov.passed and any("corroboration" in r for r in one_prov.reasons),
+          str(one_prov.reasons))
+    two_prov = evaluate_safety(_mk_snap(GOOD), _mk_facts(GOOD), {"priceImpactPct": "0.004"},
+                               cfg, providers=2)
+    check("two independent providers pass", two_prov.passed, two_prov.line())
+
+    thin_tape = MicroStats(trades_seen=5, buys_5m=4, sells_5m=1, buy_vol_5m=30.0,
+                           sell_vol_5m=5.0, buyers_5m=2)
+    check("thin tape rejected", tape_quality(thin_tape, cfg) is not None,
+          str(tape_quality(thin_tape, cfg)))
+    thin_vol = MicroStats(trades_seen=40, buys_5m=25, sells_5m=15, buy_vol_5m=120.0,
+                          sell_vol_5m=60.0, buyers_5m=12)
+    check("low-volume tape rejected", tape_quality(thin_vol, cfg) is not None,
+          str(tape_quality(thin_vol, cfg)))
+    fat_tape = MicroStats(trades_seen=60, buys_5m=38, sells_5m=22, buy_vol_5m=900.0,
+                          sell_vol_5m=350.0, buyers_5m=18)
+    check("healthy tape accepted", tape_quality(fat_tape, cfg) is None,
+          str(tape_quality(fat_tape, cfg)))
+    check("no tape at all rejected", tape_quality(None, cfg) is not None)
+
+    check("second look rejects a price drop",
+          confirmation_verdict(1.0, 0.94, 90.0, cfg) is not None)
+    check("second look rejects a lost score",
+          confirmation_verdict(1.0, 1.0, 55.0, cfg) is not None)
+    check("second look accepts a still-valid setup",
+          confirmation_verdict(1.0, 1.02, 88.0, cfg) is None,
+          str(confirmation_verdict(1.0, 1.02, 88.0, cfg)))
+    check("momentum threshold is stricter than before", cfg.momentum_threshold >= 70)
+
     # ---------- 2. momentum ------------------------------------------------
     strong = momentum_score(_mk_snap(GOOD), MicroStats(
         trades_seen=60, buys_5m=30, sells_5m=6, buy_vol_5m=3000, sell_vol_5m=200,
@@ -3549,13 +4111,109 @@ def run_selftest() -> int:
         else:
             os.environ["SOLANA_PRIVATE_KEY"] = saved_key
 
+    # ---------- 4b. restart-safe state ------------------------------------
+    async def state_roundtrip() -> Tuple[bool, str]:
+        stcfg = replace(cfg, state_file=os.path.join(tmpdir, "state.json"),
+                        heartbeat_file=os.path.join(tmpdir, "heartbeat.json"),
+                        ledger_csv=os.path.join(tmpdir, "state_trades.csv"),
+                        log_file=os.path.join(tmpdir, "state_bot.log"))
+        c1 = HttpClient(stcfg, transport=transport)
+        pf1 = Portfolio(stcfg)
+        pf1.cash_usd = 6.5
+        sw1 = Swarm(stcfg, c1, Sources(stcfg, c1), Ledger(stcfg.ledger_csv, "PAPER"),
+                    Telegram(c1), PaperExecutor(stcfg, pf1, Sources(stcfg, c1)), portfolio=pf1)
+        pos = _mk_pos()
+        pos.pos_id, pos.decimals, pos.tp1_done, pos.realized_usd = "rt1", 9, True, 0.4
+        pf1.positions[pos.pos_id] = pos
+        sw1.risk.daily_realized_usd = -1.25
+        sw1.risk.cooldowns[GOOD] = time.time() + 120
+        await sw1.save_state()
+
+        c2 = HttpClient(stcfg, transport=transport)
+        pf2 = Portfolio(stcfg)
+        sw2 = Swarm(stcfg, c2, Sources(stcfg, c2), Ledger(stcfg.ledger_csv, "PAPER"),
+                    Telegram(c2), PaperExecutor(stcfg, pf2, Sources(stcfg, c2)), portfolio=pf2)
+        ok = await sw2.load_state()
+        restored = sw2.pf.open_positions()
+        good = (ok and len(restored) == 1 and restored[0].pos_id == "rt1"
+                and restored[0].decimals == 9 and restored[0].tp1_done
+                and abs(sw2.pf.cash_usd - 6.5) < 1e-9
+                and abs(sw2.risk.daily_realized_usd + 1.25) < 1e-9
+                and GOOD in sw2.risk.cooldowns)
+        detail = "ok={} n={} cash={} daily={}".format(ok, len(restored), sw2.pf.cash_usd,
+                                                      sw2.risk.daily_realized_usd)
+        # a state file from another mode must never be imported
+        with open(stcfg.state_file, encoding="utf-8") as fh:
+            blob = json.load(fh)
+        blob["mode"] = "live" if not stcfg.live else "paper"
+        with open(stcfg.state_file, "w", encoding="utf-8") as fh:
+            json.dump(blob, fh)
+        refused = not await sw2.load_state()
+        # heartbeat + dashboard must work straight after a restore (no live facts)
+        sw2._write_heartbeat()
+        try:
+            with open(sw2.cfg.heartbeat_file, encoding="utf-8") as fh:
+                hb = json.load(fh)
+        except (OSError, ValueError):
+            hb = {}
+        hb_ok = bool(hb) and hb.get("open_positions") == 1 and "http" in hb
+        dash_ok = "OPEN POSITIONS" in sw2.dashboard()
+        return (good and refused and hb_ok and dash_ok), (
+            detail + " cross_mode_refused={} heartbeat={} dashboard={}".format(
+                refused, hb_ok, dash_ok))
+
+    state_ok, state_detail = asyncio.run(state_roundtrip())
+    check("state survives a restart (cash, position, daily loss, cooldown)", state_ok,
+          state_detail)
+
+    # ---------- 4c. signal analyzer ----------------------------------------
+    ana_path = os.path.join(tmpdir, "analyze_trades.csv")
+    with open(ana_path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(LEDGER_FIELDS)
+        def row(ev, pos="", pnl=0.0, fee=0.0, reason="", score=0.0, sym="AAA"):
+            w.writerow([utc_str(), "PAPER", "t", ev, pos, GOOD, sym, "",
+                        "", "", "", fee or "", pnl or "", score or "", reason, ""])
+        row("REJECT", reason="second look: confirm_safety: liquidity; top10")
+        row("REJECT", reason="liquidity; top10")
+        row("REJECT", reason="confirm_price_dropped -6.1%")
+        row("AWAIT_CONFIRM", reason="momentum 86.0")
+        row("SIGNAL", reason="confirmed after 25s", score=86.0)
+        row("SIGNAL", reason="confirmed after 26s", score=74.0)
+        row("BUY", pos="p1", fee=0.17, score=86.0)
+        row("BUY", pos="p2", fee=0.17, score=74.0)
+        row("SELL", pos="p1", pnl=1.10, fee=0.09, reason="TP1: ladder")
+        row("CLOSE", pos="p1", pnl=1.10, reason="TP1: ladder")
+        row("SELL", pos="p2", pnl=-1.40, fee=0.09, reason="STOP: hard stop")
+        row("CLOSE", pos="p2", pnl=-1.40, reason="STOP: hard stop")
+    ana_text, ana = analyze_ledger(ana_path, 10.0)
+    check("analyzer counts rejections per filter",
+          ana.get("rejects", {}).get("top10") == 2
+          and ana.get("rejects", {}).get("liquidity") == 1
+          and ana.get("rejects", {}).get("confirm_safety") == 1,
+          str(ana.get("rejects")))
+    check("analyzer counts signals, buys and closed trades",
+          ana.get("signals") == 2 and ana.get("buys") == 2 and ana.get("closed") == 2,
+          str({k: ana.get(k) for k in ("signals", "buys", "closed")}))
+    check("analyzer computes net pnl and win rate",
+          abs(ana.get("realized", 0.0) + 0.30) < 1e-9 and abs(ana.get("win_rate", 0) - 0.5) < 1e-9,
+          "realized={} win_rate={}".format(ana.get("realized"), ana.get("win_rate")))
+    check("analyzer refuses to call 2 trades a strategy",
+          ana.get("verdict", "").startswith("NOT ENOUGH DATA"), ana.get("verdict", ""))
+    check("analyzer report is printable", "SIGNAL QUALITY REPORT" in ana_text)
+    missing_text, missing = analyze_ledger(os.path.join(tmpdir, "nope.csv"))
+    check("analyzer handles a missing ledger", missing.get("ok") is False
+          and "No ledger" in missing_text, missing_text[:60])
+
     # ---------- 5. full pipeline with a fake network -----------------------
     tmp = tmpdir
     transport.t0 = time.time()          # restart the scripted price crash
     tcfg = replace(cfg, ledger_csv=os.path.join(tmp, "trades.csv"),
                    log_file=os.path.join(tmp, "bot.log"),
                    report_file=os.path.join(tmp, "report.txt"),
-                   momentum_threshold=0.0, dashboard_every_s=999.0,
+                   state_file=os.path.join(tmp, "state.json"),
+                   heartbeat_file=os.path.join(tmp, "heartbeat.json"),
+                   momentum_threshold=0.0, dashboard_every_s=999.0, confirm_delay_s=1.0,
                    position_refresh_s=1.0, micro_refresh_s=2.0, facts_refresh_s=2.0,
                    max_runtime_hours=26.0 / 3600.0, verbose_progress=False,
                    seen_ttl_s=120.0)
@@ -3596,6 +4254,10 @@ def run_selftest() -> int:
           abs(drift) < 0.01, "drift {:.4f}".format(drift))
     check("no position left open after shutdown", not swarm.pf.open_positions())
     check("ledger contains a PASS_SAFETY row", "PASS_SAFETY" in body)
+    check("entries wait for a second look before they can buy",
+          "AWAIT_CONFIRM" in body and "confirmed after" in body)
+    check("state file was written on shutdown", os.path.exists(tcfg.state_file),
+          tcfg.state_file)
 
     print("-" * 78)
     print("  selftest ledger: {}".format(tcfg.ledger_csv))
@@ -3614,6 +4276,247 @@ def run_selftest() -> int:
     return 0
 
 
+
+# =============================================================================
+# SECTION 16b.  SIGNAL ANALYZER  (--analyze)
+#
+# The only way to "train" a rule set like this without a research budget is to
+# measure it on your own trades and cut what does not pay. This reads trades.csv
+# and answers three questions: what blocked entries, how often a signal became a
+# trade, and whether the trades that happened made money after fees.
+# =============================================================================
+
+def clip_reason(reasons: Sequence[str], limit: int = 300) -> str:
+    """
+    Join check failures for the ledger without slicing a label in half.
+
+    A truncated 'rug_dang' is not a reason anyone can act on, and the analyzer
+    would count it as its own filter, so cut on item boundaries only.
+    """
+    out: List[str] = []
+    used = 0
+    for item in reasons:
+        item = str(item).strip()
+        if not item:
+            continue
+        if used + len(item) + 2 > limit:
+            out.append("...")
+            break
+        out.append(item)
+        used += len(item) + 2
+    return "; ".join(out).replace("; ...", "... (more)") if out else "unspecified"
+
+
+def _reject_labels(reason: str) -> List[str]:
+    """'second look: confirm_safety: liquidity; top10' -> ['confirm_safety', ...]"""
+    text = (reason or "").strip()
+    for prefix in ("second look: ", "veto: "):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    labels = []
+    for part in text.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        head = part.split(":")[0].strip()
+        head = head.split(" ")[0].strip()
+        if head:
+            labels.append(head[:40])
+    return labels or ["unspecified"]
+
+
+def _score_bucket(score: float) -> str:
+    if score <= 0:
+        return "unknown"
+    if score < 80:
+        return "70-79"
+    if score < 90:
+        return "80-89"
+    return "90-100"
+
+
+def analyze_ledger(path: str, capital_usd: float = 0.0) -> Tuple[str, Dict[str, Any]]:
+    """
+    Pure function over the CSV: no network, no config, no side effects.
+    Returns (human report, stats dict). Selftest asserts on the dict.
+    """
+    rows: List[Dict[str, str]] = []
+    try:
+        with open(path, newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            if not reader.fieldnames or "event" not in reader.fieldnames:
+                return ("{} does not look like a ledger (no 'event' column).".format(path),
+                        {"ok": False, "rows": 0})
+            rows = list(reader)
+    except FileNotFoundError:
+        return ("No ledger at {}. Run the bot (paper is fine) and try again.".format(path),
+                {"ok": False, "rows": 0})
+    except OSError as exc:
+        return ("Cannot read {}: {}".format(path, exc), {"ok": False, "rows": 0})
+
+    def fnum_row(v: Any) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    rejects: Dict[str, int] = {}
+    events: Dict[str, int] = {}
+    fees_usd = 0.0
+    pnl_by_pos: Dict[str, float] = {}
+    close_pnl: Dict[str, float] = {}
+    score_by_pos: Dict[str, float] = {}
+    symbol_by_pos: Dict[str, str] = {}
+    buy_pos: List[str] = []
+    partial: Dict[str, float] = {}
+    signal_count = buy_count = await_count = 0
+
+    for r in rows:
+        ev = (r.get("event") or "").strip().upper()
+        if not ev:
+            continue
+        events[ev] = events.get(ev, 0) + 1
+        pos_id = (r.get("pos_id") or "").strip()
+        reason = r.get("reason") or ""
+        if ev in ("REJECT", "VETO", "BUY_FAIL", "SELL_FAIL"):
+            for label in _reject_labels(reason):
+                rejects[label] = rejects.get(label, 0) + 1
+        if ev == "SIGNAL":
+            signal_count += 1
+        elif ev == "AWAIT_CONFIRM":
+            await_count += 1
+        elif ev == "BUY":
+            buy_count += 1
+            fees_usd += fnum_row(r.get("fee_usd"))
+            if pos_id:
+                buy_pos.append(pos_id)
+                score_by_pos[pos_id] = fnum_row(r.get("score"))
+                symbol_by_pos[pos_id] = (r.get("symbol") or "").strip()
+        elif ev in ("SELL", "EMERGENCY"):
+            fees_usd += fnum_row(r.get("fee_usd"))
+            if pos_id:
+                partial[pos_id] = partial.get(pos_id, 0.0) + fnum_row(r.get("pnl_usd"))
+        elif ev == "CLOSE":
+            if pos_id:
+                close_pnl[pos_id] = close_pnl.get(pos_id, 0.0) + fnum_row(r.get("pnl_usd"))
+                symbol_by_pos.setdefault(pos_id, (r.get("symbol") or "").strip())
+
+    # A trade's result is the CLOSE row; if the process died before writing one,
+    # fall back to the sum of its sells so nothing vanishes from the stats.
+    trade_pnl: Dict[str, float] = dict(close_pnl)
+    for pos_id, total in partial.items():
+        if pos_id not in trade_pnl:
+            trade_pnl[pos_id] = total
+    for pos_id in buy_pos:
+        trade_pnl.setdefault(pos_id, 0.0)
+    closed = [p for p in trade_pnl if p in close_pnl or p in partial]
+    wins = [p for p in closed if trade_pnl[p] > 0]
+    losses = [p for p in closed if trade_pnl[p] <= 0]
+    realized = sum(trade_pnl.values())
+    open_trades = [p for p in buy_pos if p not in closed]
+
+    # Signal -> trade conversion (the number that tells you if the filters are too tight)
+    buys_per_signal = (buy_count / signal_count) if signal_count else 0.0
+    # Momentum score vs outcome: does a higher score actually mean more money?
+    buckets: Dict[str, List[float]] = {}
+    for pos_id in closed:
+        buckets.setdefault(_score_bucket(score_by_pos.get(pos_id, 0.0)), []).append(trade_pnl[pos_id])
+
+    gross_win = sum(v for v in trade_pnl.values() if v > 0)
+    gross_loss = -sum(v for v in trade_pnl.values() if v < 0)
+    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else (999.0 if gross_win else 0.0)
+    avg_win = (gross_win / len(wins)) if wins else 0.0
+    avg_loss = (-gross_loss / len(losses)) if losses else 0.0
+    expectancy = (realized / len(closed)) if closed else 0.0
+    win_rate = (len(wins) / len(closed)) if closed else 0.0
+
+    lines = []
+    lines.append("=" * 78)
+    lines.append(" SIGNAL QUALITY REPORT   {}".format(path))
+    lines.append("=" * 78)
+    lines.append(" ledger rows              : {:,}".format(len(rows)))
+    lines.append(" first looks held         : {:,}".format(await_count))
+    lines.append(" confirmed signals        : {:,}".format(signal_count))
+    lines.append(" buys executed            : {:,}   ({:.1f}% of signals)".format(
+        buy_count, buys_per_signal * 100))
+    lines.append(" positions still open     : {:,}".format(len(open_trades)))
+    lines.append(" closed trades            : {:,}".format(len(closed)))
+    lines.append("")
+    lines.append(" MONEY (paper or live, as recorded)")
+    lines.append("   realized pnl           : {:>+10.2f} USD{}".format(
+        realized, "   ({:+.1f}% of capital)".format(realized / capital_usd * 100)
+        if capital_usd > 0 else ""))
+    lines.append("   fees paid              : {:>10.2f} USD".format(fees_usd))
+    lines.append("   win rate               : {:>10.1f}%  ({}W / {}L)".format(
+        win_rate * 100, len(wins), len(losses)))
+    lines.append("   avg win / avg loss     : {:>+10.2f} / {:+.2f} USD".format(avg_win, avg_loss))
+    lines.append("   profit factor          : {:>10.2f}   (>1.2 is the minimum to trust)".format(
+        profit_factor))
+    lines.append("   expectancy per trade   : {:>+10.3f} USD".format(expectancy))
+    if closed:
+        lines.append("   best / worst trade     : {:>+10.2f} / {:+.2f} USD".format(
+            max(trade_pnl.values()), min(trade_pnl.values())))
+    lines.append("")
+    lines.append(" WHAT BLOCKED ENTRIES  (top reasons, counted per filter)")
+    if rejects:
+        total_rejects = sum(rejects.values())
+        for label, n in sorted(rejects.items(), key=lambda kv: -kv[1])[:15]:
+            lines.append("   {:<24} {:>6}  {:>5.1f}%".format(
+                label[:24], n, n / total_rejects * 100))
+    else:
+        lines.append("   nothing yet - no rejections logged")
+    lines.append("")
+    lines.append(" DOES A HIGHER SCORE MAKE MORE MONEY?")
+    if buckets:
+        for label in ("70-79", "80-89", "90-100", "unknown"):
+            if label not in buckets:
+                continue
+            vals = buckets[label]
+            w = sum(1 for v in vals if v > 0)
+            lines.append("   score {:<8} {:>3} trades  {:>3.0f}% wins  {:>+8.2f} USD".format(
+                label, len(vals), (w / len(vals) * 100) if vals else 0.0, sum(vals)))
+    else:
+        lines.append("   no closed trades yet")
+    lines.append("")
+
+    # ---- verdict: deliberately pessimistic, because optimism is expensive here
+    if len(closed) < 20:
+        verdict = ("NOT ENOUGH DATA. {} closed trade(s). Below ~20 trades the numbers are "
+                   "noise; below ~100 they are still a coin flip. Keep it in paper mode."
+                   .format(len(closed)))
+    elif realized <= 0:
+        verdict = ("NEGATIVE. The rules lost {:.2f} USD over {} trades (profit factor {:.2f}). "
+                   "Do not run this with real money - loosen nothing, tighten the losing "
+                   "filter, or stop.".format(realized, len(closed), profit_factor))
+    elif profit_factor < 1.2:
+        verdict = ("MARGINAL. +{:.2f} USD over {} trades, profit factor {:.2f}. One bad "
+                   "trade erases it. Not a signal you can size up."
+                   .format(realized, len(closed), profit_factor))
+    elif len(losses) and avg_win < abs(avg_loss) * 1.2:
+        verdict = ("FRAGILE. Positive, but wins and losses are too similar ({:+.2f} vs {:+.2f}); "
+                   "the edge is fees and luck away from zero.".format(avg_win, avg_loss))
+    else:
+        verdict = ("POSITIVE so far: {:+.2f} USD over {} trades, profit factor {:.2f}. "
+                   "That is evidence, not proof - forward results drift and every strategy "
+                   "here has a bad week.".format(realized, len(closed), profit_factor))
+    lines.append(" VERDICT")
+    lines.append("   " + verdict)
+    lines.append("")
+    lines.append(" Honest reminder: there is no such thing as a sure signal in memecoins.")
+    lines.append(" This report measures whether these filters paid, not whether they will.")
+    lines.append("=" * 78)
+
+    stats = {
+        "ok": True, "rows": len(rows), "signals": signal_count, "awaits": await_count,
+        "buys": buy_count, "closed": len(closed), "open": len(open_trades),
+        "wins": len(wins), "losses": len(losses), "win_rate": win_rate,
+        "realized": realized, "fees": fees_usd, "profit_factor": profit_factor,
+        "rejects": rejects, "buckets": {k: (len(v), sum(v)) for k, v in buckets.items()},
+        "verdict": verdict,
+    }
+    return "\n".join(lines), stats
+
+
 # =============================================================================
 # SECTION 17.  ENTRY POINT
 # =============================================================================
@@ -3622,6 +4525,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cfg, args = build_config(argv)
     if args.selftest:
         return run_selftest()
+    if args.analyze is not None:
+        path = cfg.ledger_csv if args.analyze == "__auto__" else args.analyze
+        text, _stats = analyze_ledger(path, cfg.start_capital_usd)
+        print(text)
+        return 0
     if cfg.live:
         if not confirm_live():
             print("Live confirmation failed. Staying safe. Nothing was traded.")

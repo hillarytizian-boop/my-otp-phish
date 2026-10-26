@@ -4,6 +4,11 @@ bot.log
 bot.log.*
 final_report.txt
 free_run_report.txt
+state.json
+state.json.tmp
+heartbeat.json
+heartbeat.json.tmp
+trades.*.csv
 STOP
 __pycache__/
 *.pyc
