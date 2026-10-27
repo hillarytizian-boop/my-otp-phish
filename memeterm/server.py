@@ -124,7 +124,9 @@ class TerminalServer:
         self.port = port
         self.quiet = quiet
         self.remote = host not in ("127.0.0.1", "localhost", "::1")
-        self.access_code = access_code or (secrets.token_urlsafe(9) if self.remote else "")
+        self.access_code = (access_code
+                            or os.environ.get("MEMETERM_ACCESS_CODE", "")
+                            or (secrets.token_urlsafe(9) if self.remote else ""))
         self.sessions = SessionStore()
         self.mutation_limiter = RateLimiter(limit=90, window_s=60)
         self.auth_limiter = RateLimiter(limit=6, window_s=60)
