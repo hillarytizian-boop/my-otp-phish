@@ -10,5 +10,10 @@ heartbeat.json
 heartbeat.json.tmp
 trades.*.csv
 STOP
+.env
+.env.*
+!.env.example
+signals.json
+signals.json.tmp
 __pycache__/
 *.pyc

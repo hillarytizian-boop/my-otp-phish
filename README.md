@@ -7,6 +7,10 @@ scams, scores momentum, and trades in tiny fixed size with hard risk limits.
 **Paper mode is the default and needs zero third-party packages.** Live mode needs
 `solders` (Solana transaction signing) and a burner wallet.
 
+It also has a **signal-only mode** that never places an order: `--scan` prints research
+cards once, `--watch` keeps printing them and can push the confirmed ones to Telegram.
+See [§2b](#2b-signals-only-scan-and-watch-never-trades).
+
 > **On "sure signals".** There is no such thing as a sure signal in memecoins, and no
 > amount of agent count changes that. What this version does instead is make entries
 > *harder* (stricter score, real tape required, every filter re-checked on a second look),
@@ -37,7 +41,10 @@ cd my-otp-phish
 # 3) prove it works offline: no network, no keys, no money (~50 s)
 python meme_agents.py --selftest
 
-# 4) run it: PAPER mode, simulated fills, no real money
+# 4) look at signals without trading anything (research only)
+python meme_agents.py --scan
+
+# 5) or run the trading bot: PAPER mode, simulated fills, no real money
 python meme_agents.py
 ```
 
@@ -156,6 +163,62 @@ never in the discovery loop.
 
 ---
 
+## 1c. Optional: FOMO flow data — what actually exists
+
+**Short answer: FOMO Labs (fomo.family) publishes no public API.** No developer portal,
+no API-key flow, no documented endpoints, no SDK, and their terms do not permit
+automating the private backend. Anything that asks for your FOMO login, wallet or seed
+phrase to "connect to the FOMO API" is a scam. This project never does that.
+
+What it can use instead is **`fomoapi.io`** — an independent, *unofficial* data service
+("not affiliated with fomo.family", in their own words) that republishes FOMO token flow
+and warnings over REST:
+
+| endpoint | what it gives | cost |
+|---|---|---|
+| `GET /v2/token/{mint}/stats` | buys/sells, unique buyers/sellers, buy & sell volume, net flow on 5m/1h/4h/24h, holders, top-10 % | 250 credits |
+| `GET /v2/token/{mint}/warnings` | `sellDisabled`, `tradingDisabled`, `severe`, per-warning `type` codes | 250 credits |
+| `GET /v2/token/{mint}/devs` | deployer/insider holdings, cost basis, realized & unrealized PnL | 250 credits |
+| `GET /token/{mint}/holders` | FOMO's live top holders | 250 credits |
+
+Auth is `authorization: Bearer <key>`; errors are 401/402/404/429/503 and `retry-after`
+is honoured. A free key allows 20 requests/minute and 250,000 credits/month.
+
+```bash
+export FOMO_API_KEY='...'          # from https://fomoapi.io/dashboard
+python meme_agents.py --scan       # now enriched with FOMO flow + warnings
+python meme_agents.py --no-fomo --scan   # force it off again
+```
+
+How the bot uses it — deliberately, because it costs money and can be wrong:
+
+1. **Only after the local filters pass.** Credits are spent on real candidates, never on
+   a census. Default cap: 3 FOMO lookups per scan (`--fomo-max-tokens N`).
+2. **Veto, not opinion.** `sellDisabled`/`tradingDisabled`, a `SEVERE` warning, a top-10
+   concentration above the config limit, or a deployer who has sold out (realized profit,
+   nothing held) all **reject** the token (`fomo_tradable`, `fomo_severe`, `fomo_top10`,
+   `fomo_dev_exit`).
+3. **Small, explained score bonus.** Confirming 5m flow (≥8 unique buyers and ≥1.3
+   buy/sell, plus positive net inflow on 5m *and* 1h) adds at most +4 points
+   (`fomo_score_boost`), and the reason is printed on the card.
+4. **Silence is not safety.** An empty warnings list means FOMO said nothing, which the
+   code treats as unknown — never as a pass.
+5. **Missing/unavailable is fine.** No key, 429 storm, timeout or 5xx simply means the
+   card shows `fomo n/a` and the price/tape rules decide alone. The bot is fully
+   functional without this provider.
+
+`--fomo-include-slow` additionally fetches devs + holders (500 more credits per token).
+Check what you are spending in the scan header: `fomo ok 1000cr`.
+
+Standalone check (no key needed):
+
+```bash
+python fomo_provider.py                 # prints status, endpoints, cost, doc note
+FOMO_API_KEY=... python fomo_provider.py <mint>   # one live lookup, prints JSON
+```
+
+---
+
 ## 2. Run
 
 ### Paper mode (default, simulated fills, no real money)
@@ -174,14 +237,17 @@ positions, prints a summary and exits cleanly.
 python meme_agents.py --selftest
 ```
 
-Runs 101 assertions: every safety filter, copycat/name and tape-quality gates, the
+Runs 148 assertions: every safety filter, copycat/name and tape-quality gates, the
 second-look confirmation, momentum scoring, the full exit ladder
 (stop-loss, +100 %/+300 % take-profits, 15 %/10 % trailing, time stop, all three
 emergencies), paper fill maths, the live execution path against a fake `solders` +
 fake RPC (including "a failed send is never retried"), and a 26-second end-to-end
 pipeline run against canned API payloads, a state save/restore round trip, the
 web-research wrappers against a *fake* browser (cache, dead source, login wall, veto,
-boost, clamping) and the `--analyze` report. Also proves realised PnL reconciles with equity.
+boost, clamping), the FOMO provider against a fake HTTP transport (parsing, 429 retry,
+timeout, 401 fail-fast, malformed JSON, partial data, cache, dev-exit veto), the signal
+model (levels, R:R, statuses, expiry, invalidation), Telegram on/off plus duplicate-alert
+suppression, a full scan pass, and the `--analyze` report. Also proves realised PnL reconciles with equity.
 
 ### 24-hour forward paper test
 
@@ -219,6 +285,65 @@ python -c "import json,time;d=json.load(open('heartbeat.json'));print(round(time
 
 State is **per mode**: a `state.json` from a live run is refused by paper mode and vice
 versa. Start fresh on purpose with `--no-state`, or move the file away.
+
+### 2b. Signals only: `--scan` and `--watch` (never trades)
+
+Both commands reuse the exact discovery, safety and momentum code the trading bot
+uses, but they only ever **report**. No wallet, no key, no executor, no ledger rows.
+
+```bash
+python meme_agents.py --scan                 # one pass, prints cards, exits
+python meme_agents.py --scan 5               # consider 5 candidates instead of 8
+python meme_agents.py --scan 3 --json        # machine-readable
+python meme_agents.py --watch                # continuous, refresh every 120 s
+python meme_agents.py --watch --refresh 60   # faster refresh
+python meme_agents.py --watch --iterations 5 # stop after 5 scans
+```
+
+Each card shows the symbol, the **full verified mint**, price with its age, FDV and
+liquidity (labelled), 5m/1h change and volume, buy/sell tape, safety status, warnings,
+score, an entry zone, an invalidation level, TP1/TP2 ladder prices, the R:R arithmetic,
+the data sources and the status:
+
+| status | meaning |
+|---|---|
+| `WATCH` | passes safety, momentum below the threshold — interesting, not actionable |
+| `CANDIDATE` | momentum + real tape pass; waiting for the second look |
+| `CONFIRMED` | the second look re-fetched everything and it all still passed |
+| `REJECTED` | a safety filter or the second look failed, with the reason |
+| `INVALIDATED` | was confirmed, price has since broken the invalidation level |
+| `EXPIRED` | too old to act on (30 min unconfirmed, 2 h confirmed) |
+
+Example (shortened rows, real layout is 58 columns wide):
+
+```
++--------------------------------------------------------+
+| CONFIRMED $BONK2 score 84                              |
+| ------------------------------------------------------ |
+| mint 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU      |
+| price $0.0000123 (2s old)                              |
+| FDV $12.4M LIQ $210.0K                                 |
+| 5m +8.2% vol $42.1K                                    |
+| tape 24 buys / 9 sells (18 buyers)                     |
+| ------------------------------------------------------ |
+| safety 18 checks passed                                |
+| ENTRY $0.0000119 - $0.0000124                          |
+| INVAL $0.00000984 (-20% stop rule)                     |
+| TP1 $0.0000246 (+100%, sell 50%)                       |
+| TP2 $0.0000492 (+300%, sell 25%)                       |
+| R:R 5.0 : 1 to TP1 (before fees/slippage)              |
++--------------------------------------------------------+
+| PAPER MODE - RESEARCH ONLY, NO REAL TRADE              |
++--------------------------------------------------------+
+```
+
+`--watch` also writes `signals.json` on every pass (atomic, git-ignored) and prints a
+compact dashboard: provider health, status counts, the top rows and the freshness of
+the last refresh. Ctrl+C or `touch STOP` ends it cleanly.
+
+**What "CONFIRMED" does not mean:** it means the same setup survived a second,
+independent fetch ~20 s later. It is not a prediction, and at $2 size one round trip
+costs ~$0.34 in fixed fees before the price moves at all.
 
 ### `--analyze` — did the filters actually work?
 
@@ -258,6 +383,54 @@ verdict. No wallet, no orders, no state changes. **Run this before trusting the
 research gate** — if your phone cannot open DuckDuckGo, you want to know now, not
 after a lost trade.
 
+### Telegram alerts — setup and a safe test
+
+Telegram is **optional**; with no credentials the terminal output is identical and
+nothing is sent.
+
+1. In Telegram, talk to **@BotFather** → `/newbot` → copy the token.
+2. Get your chat id from **@userinfobot** (or message the bot, then read
+   `getUpdates`).
+3. Export both and run `--watch`:
+
+```bash
+export TELEGRAM_BOT_TOKEN='123456:ABC-DEF...'
+export TELEGRAM_CHAT_ID='123456789'
+python meme_agents.py --watch --refresh 120
+```
+
+Only **CONFIRMED** and **INVALIDATED** signals are pushed, each at most once per
+`telegram_signal_cooldown_s` (default 30 min) per mint and status — a refresh loop will
+not spam you. Every message ends with `PAPER MODE - NO REAL TRADE EXECUTED`.
+
+Safe test procedure, in order:
+
+```bash
+# 1) does the token work at all? (sends exactly one test line, no signals)
+python - <<'PY'
+import os, json, urllib.request
+tok, chat = os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"]
+req = urllib.request.Request(
+    "https://api.telegram.org/bot{}/sendMessage".format(tok),
+    data=json.dumps({"chat_id": chat,
+                     "text": "meme_agents test: PAPER MODE, no trades"}).encode(),
+    headers={"Content-Type": "application/json"})
+print(urllib.request.urlopen(req, timeout=15).status)
+PY
+
+# 2) run one real scan and read the cards in the terminal
+python meme_agents.py --scan 3
+
+# 3) run the watcher for two passes; a message appears only if a signal confirms
+python meme_agents.py --watch --iterations 2 --refresh 30
+```
+
+If no message arrives, that is usually correct: nothing was CONFIRMED. `--scan` never
+sends (it is one-shot by design), and the dashboard shows `telegram: on (N sent)`.
+
+The token is read from the environment only, never written to disk, never logged, and
+never committed — `.env` is git-ignored, `.env.example` holds placeholders only.
+
 ### Live mode — burner wallet only
 
 ```bash
@@ -291,6 +464,7 @@ wallet holds much more than its configured capital.
 | `state.json` | restart-safe portfolio: cash, open positions, daily-loss counter, cooldowns, recent reject counts. Atomic write. |
 | `heartbeat.json` | liveness snapshot every 10 s (equity, positions, HTTP counters, feed health). |
 | `trades.csv.<timestamp>.csv` | automatic backup whenever the ledger schema changes, so old runs are never mixed into a new column layout. |
+| `signals.json` | latest signals from `--watch` (statuses, scores, levels, sources). Git-ignored. |
 | `STOP` | create this file to trigger the kill switch. |
 
 Research keeps its cache in memory only (per URL, 15 min). It writes no files and no
@@ -304,6 +478,9 @@ cookies unless you pass `--research-storage-dir` to Obscura.
 scouts (24)          safety (24)            momentum (22)         confirmation       executors (29)
 poll 5 feeds ──► enrich + 20 hard checks ──► score tape ──► park 25s, re-fetch ──► web research ──► risk veto, buy,
                  (2+ providers needed)      (>=70, real tape)  and re-check all   (optional veto)   manage exits
+                        │
+                        └─► --scan / --watch: same pipeline, reports only (never trades),
+                            optional FOMO flow/warning enrichment, Telegram on CONFIRMED
                                                                                     
                           risk manager (1): daily loss stop, kill switch, absolute veto
 ```
@@ -352,6 +529,13 @@ poll 5 feeds ──► enrich + 20 hard checks ──► score tape ──► pa
   login wall, timeout) changes nothing unless you pass `--research-required`, in which
   case no research means no trade. Every result is written to the ledger as a
   `RESEARCH` row and counted in `heartbeat.json`.
+* **Signal pipeline (`--scan` / `--watch`):** the same discovery, safety and momentum code
+  as the trading swarm, minus every path that could place an order. It de-duplicates
+  candidates by mint, evaluates them with a bounded concurrency, waits
+  `scan_confirm_delay_s` (20 s) and re-fetches every `CANDIDATE` before it can become
+  `CONFIRMED`. Cards carry price + age, FDV/liquidity (labelled), 5m/1h momentum, tape,
+  safety status, warnings, entry zone, invalidation, TP1/TP2 and the R:R arithmetic.
+  Statuses move `WATCH → CANDIDATE → CONFIRMED`, or `REJECTED`/`INVALIDATED`/`EXPIRED`.
 * **Exits:** hard −20 % stop; sell 50 % of the position at +100 %; 25 % at +300 %;
   trailing stop on the remainder, 15 % below the highest price seen, tightened to 10 %
   once the position is up 500 %; emergency exit on a 40 % liquidity drop (or zero
@@ -377,6 +561,15 @@ Everything is in the `Config` dataclass at the top of the file (grep for
 --dashboard-every S       dashboard interval (default 30)
 --ledger PATH / --log-file PATH
 --cg-key KEY              optional CoinGecko key for /coins/list/new
+--scan [N]                one-shot research scan, prints N cards, exits (never trades)
+--watch                   continuous research monitor (never trades)
+--refresh S               --watch interval (default 120)
+--iterations N            --watch: stop after N scans
+--json                    machine-readable output for --scan
+--no-fomo                 ignore FOMO_API_KEY even if set
+--fomo-include-slow       also fetch FOMO devs + holders (+500 credits/token)
+--fomo-max-tokens N       FOMO lookups per scan (default 3)
+--full                    full-width dashboard instead of the compact phone view
 --analyze [CSV]           signal-quality report from the ledger, then exit
 --research / --no-research  force the web-research gate on/off (default: on if installed)
 --obscura PATH            obscura binary (default: $OBSCURA_BIN, PATH, ./obscura)
@@ -396,6 +589,11 @@ Signal-quality knobs in `Config`: `momentum_threshold=70`, `min_corroboration=2`
 `confirm_delay_s=25.0`, `confirm_max_drop_pct=5.0`, `min_trades_5m=12`,
 `min_unique_buyers_5m=6`, `min_tape_volume_5m_usd=200`, `reject_copycats=True`,
 `max_positions_per_symbol=1`.
+
+Signal/FOMO knobs: `scan_max_candidates=8`, `scan_confirm_delay_s=20`,
+`scan_concurrency=3`, `signal_expiry_s=1800`, `watch_interval_s=120`,
+`telegram_signal_cooldown_s=1800`, `fomo_max_tokens_per_scan=3`,
+`fomo_score_boost=4.0`, `fomo_cache_ttl_s=900`, `fomo_veto_dev_exit=True`.
 
 Research knobs: `research_enabled`, `research_max_sources=3`, `research_timeout_s=25`,
 `research_min_interval_s=2.5`, `research_cache_ttl_s=900`, `research_boost_points=5`,
@@ -476,7 +674,24 @@ Loosen them and you are back to buying noise — `--analyze` will show you the b
 20. **Research can make you slower, and late news is already priced in.** A 25-second
     confirmation plus a few browser launches means you are usually the last to know.
     If API data already tells the story, research adds latency more than edge.
-21. **Not audited.** This is a single-file hobby bot written in one sitting. Read the
+21. **There is no official FOMO API.** `fomo.family` publishes none, so the optional
+    provider uses `fomoapi.io`, an independent unofficial reseller. It can disappear,
+    change shape, or be wrong, and it is not a security audit. Verify anything you act
+    on against the chain itself.
+22. **FOMO data is flow, not price.** `/stats` has no price field, so prices still come
+    from DexScreener/GeckoTerminal; FOMO contributes trade counts, unique buyers, net
+    volume, holder concentration, warnings and dev holdings.
+23. **Credits are real money-adjacent.** 250 credits per call, 20 requests/minute on a
+    free key (250k credits/month). Defaults cap this at 3 tokens per scan with a 15-minute
+    cache, but a long `--watch` session still burns credits — watch `fomo ok Ncr` in the
+    header.
+24. **An empty FOMO warning list is not a clean bill of health**, and `allowlisted` is
+    FOMO's opinion. The code only treats warnings as vetoes; silence stays "unknown".
+25. **`CONFIRMED` still does not mean "will go up".** It means the setup survived a
+    second independent fetch. Signals expire (`EXPIRED`) or break (`INVALIDATED`) because
+    these moves decay in minutes; a signal you read from `signals.json` an hour later is
+    history, not an instruction.
+26. **Not audited.** This is a single-file hobby bot written in one sitting. Read the
     code before you fund it, and treat the $10 as already spent.
 
 ---
@@ -486,6 +701,10 @@ Loosen them and you are back to buying noise — `--analyze` will show you the b
 | Symptom | Cause / fix |
 |---|---|
 | `STARTUP FAILED: LIVE mode needs the 'solders' package` | `pkg install rust binutils libsodium && pip install solders`, or stay in paper mode. |
+| `--scan` prints "No candidates this pass" | Normal with strict filters, and also what happens when the public APIs are unreachable from your network. The header shows `feeds 0/5 ok`. |
+| `fomo: disabled (no FOMO_API_KEY)` | Working as designed. Export the key, or ignore it. |
+| `fomo ... 402` / `credits_exhausted` | Out of credits. The provider stops being used; the scan continues on price data. |
+| `--watch` sends no Telegram messages | Nothing was CONFIRMED, or the token/chat id is wrong. Run the safe test in §2 first. |
 | No trades for hours | Expected with strict filters: liquidity ≥ $50k, LP locked, authorities revoked, age ≥ 10 min, impact ≤ 3 %, tape ≥ 12 trades/6 buyers/$200, and a second look 25 s later. Lower `--threshold` or relax `Config` — at your own risk. |
 | `research-check` says `NOT FOUND` | Set `OBSCURA_BIN`, or install it (README §1b). Everything else still works. |
 | `research_veto` rejections feel wrong | Read the `RESEARCH` row in `trades.csv`; it quotes the page. Tune `research_scam_min_sources` / `research_scam_veto_hits`, or `--no-research`. |
