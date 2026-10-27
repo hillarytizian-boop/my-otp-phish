@@ -7,10 +7,12 @@ project. Standard library only: it runs on Termux with no compiler and no pip
 install. The browser UI is served from ./memeterm/web as static files.
 
     python meme_terminal.py serve                 # http://127.0.0.1:8787
+    python meme_terminal.py open                  # serve, then open the browser
     python meme_terminal.py serve --allow-remote  # adds an access code (preview/LAN)
     python meme_terminal.py agents BTCUSDT        # run the 100 agents once
     python meme_terminal.py backtest BTCUSDT      # chronological, cost-aware test
     python meme_terminal.py train BTCUSDT --save  # same, and store the model
+    python meme_terminal.py train-suite           # train the top 45 USDT pairs
     python meme_terminal.py verify-key            # read-only permission check
     python meme_terminal.py selftest              # offline test suite
 
@@ -25,10 +27,13 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from typing import Any, Dict, List, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,7 +47,8 @@ from memeterm.binance import BinanceError                          # noqa: E402
 from memeterm.config import ConfigError, TerminalConfig            # noqa: E402
 from memeterm.engine import LIVE_CONFIRMATION, EngineError, TradingEngine  # noqa: E402
 from memeterm.server import TerminalServer                         # noqa: E402
-from memeterm.util import fmt_money, parse_day_ms, utc_str          # noqa: E402
+from memeterm.universe import describe_selection, select_symbols     # noqa: E402
+from memeterm.util import fmt_money, parse_day_ms, utc_str, write_json  # noqa: E402
 
 
 BANNER = r"""
@@ -85,12 +91,87 @@ def print_json(payload: Any) -> None:
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
+def terminal_url(cfg: TerminalConfig) -> str:
+    """The URL a browser on this device should use (never 0.0.0.0)."""
+    host = str(cfg.host or "127.0.0.1")
+    if host in ("0.0.0.0", "::", ""):
+        host = "127.0.0.1"
+    return "http://{}:{}".format(host, int(cfg.port))
+
+
+def probe_terminal(url: str, timeout: float = 1.2) -> bool:
+    """True when *this* terminal already answers on that URL."""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/api/health",
+                                    timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return bool(payload.get("ok"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def browser_commands(url: str) -> List[List[str]]:
+    """Browsers available on Termux/Android/Linux/macOS, in order of preference."""
+    commands: List[List[str]] = []
+    if shutil.which("termux-open-url"):
+        commands.append(["termux-open-url", url])
+    if shutil.which("am"):
+        commands.append(["am", "start", "-a", "android.intent.action.VIEW", "-d", url])
+    for opener in ("xdg-open", "sensible-browser", "open"):
+        if shutil.which(opener):
+            commands.append([opener, url])
+    return commands
+
+
+def launch_browser(url: str, *, print_only: bool = False,
+                   timeout: float = 12.0) -> Dict[str, Any]:
+    """Open `url` in a local browser. Never raises: the URL is always printed."""
+    outcome: Dict[str, Any] = {"url": url, "opened": False, "via": None,
+                               "tried": [], "print_only": print_only}
+    if print_only:
+        return outcome
+    for command in browser_commands(url):
+        outcome["tried"].append(command[0])
+        try:
+            finished = subprocess.run(command, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL, timeout=timeout)
+            if finished.returncode == 0:
+                outcome.update(opened=True, via=command[0])
+                return outcome
+        except (OSError, subprocess.SubprocessError):
+            continue
+    try:
+        import webbrowser
+        if webbrowser.open(url, new=2):
+            outcome.update(opened=True, via="webbrowser")
+    except Exception:                                   # never break the server
+        pass
+    return outcome
+
+
+def print_browser_outcome(outcome: Dict[str, Any]) -> None:
+    if outcome.get("print_only"):
+        print("  browser        : not launched (--print-only)")
+        print("  open this URL  : {}".format(outcome["url"]))
+    elif outcome.get("opened"):
+        print("  browser        : opened via {}".format(outcome.get("via")))
+    else:
+        print("  browser        : no opener found on this device")
+        print("  open this URL  : {}".format(outcome["url"]))
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     cfg = build_config(args)
+    wants_browser = bool(getattr(args, "open_browser", False))
+    print_only = bool(getattr(args, "print_only", False))
+    if wants_browser and probe_terminal(terminal_url(cfg)):
+        print("  terminal already running at {}".format(terminal_url(cfg)))
+        print_browser_outcome(launch_browser(terminal_url(cfg), print_only=print_only))
+        return 0
     engine = build_engine(cfg)
     remote = cfg.host not in ("127.0.0.1", "localhost", "::1")
     server = TerminalServer(cfg, engine, host=cfg.host, port=cfg.port,
-                            quiet=args.quiet)
+                            quiet=bool(getattr(args, "quiet", False)))
     url = server.start()
     engine.start_background()
 
@@ -112,6 +193,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print("  dashboard      : {}   (loopback only)".format(url))
     print("  open it in the Android browser at the address above; add it to your")
     print("  home screen for a full-screen terminal. Ctrl+C stops cleanly.")
+    if wants_browser:
+        print_browser_outcome(launch_browser(url, print_only=print_only))
     print()
 
     stopping = {"done": False}
@@ -245,6 +328,156 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_train_suite(args: argparse.Namespace) -> int:
+    """Train and evaluate a ranked batch of symbols (default: top 45 USDT pairs).
+
+    One symbol failing never stops the batch; every row keeps its own error.
+    A model that did not beat the baseline on a sufficient sample is reported as
+    exactly that - the summary never claims a working strategy.
+    """
+    cfg = build_config(args)
+    engine = build_engine(cfg)
+    quote = (getattr(args, "quote", None) or "USDT").upper()
+    interval = getattr(args, "interval", None) or "1h"
+    bars = max(200, min(int(getattr(args, "bars", 1200) or 1200), 5000))
+    count = max(1, min(int(getattr(args, "count", 45) or 45), 200))
+    horizon = max(1, min(int(getattr(args, "horizon", 6) or 6), 100))
+    label = re.sub(r"[^A-Za-z0-9._-]", "", str(getattr(args, "label", "") or ""))[:24]
+    save = not bool(getattr(args, "no_save", False))
+    as_json = bool(getattr(args, "json", False))
+
+    explicit = str(getattr(args, "symbol_list", "") or "").strip()
+    if explicit:
+        wanted = [item.upper() for item in re.split(r"[,\s]+", explicit) if item]
+        selection: Dict[str, Any] = {
+            "symbols": [{"symbol": symbol,
+                         "base": symbol[:-len(quote)] if symbol.endswith(quote) else symbol,
+                         "quote": quote, "quote_volume": 0.0, "price": 0.0,
+                         "change_pct": 0.0} for symbol in wanted],
+            "skipped": {}, "requested": len(wanted), "available": len(wanted),
+            "quote": quote, "source": "explicit --list",
+        }
+    else:
+        try:
+            info = engine.client.exchange_info()
+            tickers = engine.client.ticker_24h()
+        except BinanceError as exc:
+            print("could not read the exchange universe: {}".format(exc))
+            return 2
+        selection = select_symbols(info, tickers, count=count, quote=quote)
+        selection["source"] = "ranked by 24h quote volume"
+
+    symbols = [row["symbol"] for row in selection["symbols"]]
+    if not symbols:
+        print("no tradable {} pairs matched the filter".format(quote))
+        return 2
+
+    if not as_json:
+        print(BANNER)
+        print(" training {} symbols · {} · {} bars · {}".format(
+            len(symbols), interval, bars, selection["source"]))
+        print(" {}".format(describe_selection(selection)))
+        print(" {:<18} {:>6} {:>7} {:>9} {:>9} {:>7} {:>8}".format(
+            "symbol", "bars", "trades", "net %", "expect", "sample", "baseline"))
+
+    rows: List[Dict[str, Any]] = []
+    started = time.time()
+    for symbol in symbols:
+        row: Dict[str, Any] = {"symbol": symbol, "ok": False}
+        try:
+            candles = collect_candles(engine.client, symbol, interval, bars)
+            if not candles:
+                row["error"] = "no candles returned"
+            else:
+                report = engine.backtester.run(
+                    candles, symbol=symbol, interval=interval, horizon=horizon,
+                    persist=save, label=label or "suite")
+                if not report.get("ok"):
+                    row["error"] = str(report.get("error") or "backtest failed")[:160]
+                else:
+                    metrics = report["metrics"]
+                    row.update({
+                        "ok": True,
+                        "usable_bars": report["bars"]["usable"],
+                        "trades": metrics["trades"],
+                        "net_return_pct": metrics["net_return_pct"],
+                        "expectancy": metrics["expectancy"],
+                        "sample_sufficient": bool(metrics["sample_sufficient"]),
+                        "beats_baseline": bool(metrics["beats_baseline"]),
+                        "baseline_expectancy": metrics.get("baseline_expectancy"),
+                        "model_version": (report.get("model") or {}).get("version", ""),
+                    })
+        except (BinanceError, EngineError) as exc:
+            row["error"] = str(exc)[:160]
+        except Exception as exc:                    # one bad symbol must not stop 44 others
+            row["error"] = "{}: {}".format(type(exc).__name__, str(exc))[:160]
+        rows.append(row)
+
+        if not as_json:
+            if row["ok"]:
+                print(" {:<18} {:>6} {:>7} {:>9.3f} {:>9.4f} {:>7} {:>8}".format(
+                    symbol, row["usable_bars"], row["trades"], row["net_return_pct"],
+                    row["expectancy"], "yes" if row["sample_sufficient"] else "no",
+                    "yes" if row["beats_baseline"] else "no"))
+            else:
+                print(" {:<18} {:>6}   {}".format(symbol, "-", row["error"]))
+        if not getattr(cfg, "demo", False):
+            time.sleep(0.35)                        # stay polite to the exchange
+
+    trained = [row for row in rows if row["ok"]]
+    sufficient = [row for row in trained if row["sample_sufficient"]]
+    beat = [row for row in trained if row["beats_baseline"]]
+    summary: Dict[str, Any] = {
+        "ok": bool(trained),
+        "generated_utc": utc_str(),
+        "interval": interval,
+        "bars": bars,
+        "horizon": horizon,
+        "quote": quote,
+        "source": selection["source"],
+        "requested": count,
+        "selected": len(symbols),
+        "skipped": selection.get("skipped", {}),
+        "trained": len(trained),
+        "sample_sufficient": len(sufficient),
+        "beat_baseline": len(beat),
+        "failed": len(rows) - len(trained),
+        "elapsed_s": round(time.time() - started, 1),
+        "label": label,
+        "saved_models": save,
+        "rows": rows,
+        "verdict": ("no model beat the momentum baseline on a sufficient sample"
+                    if not beat else
+                    "{} of {} models beat the baseline - a hypothesis, "
+                    "not a licence to trade".format(len(beat), len(trained))),
+        "honesty": ("Backtests are in-sample hypotheses with a small holdout. "
+                    "A passing batch never enables live trading."),
+    }
+    if save:
+        models_dir = os.path.join(cfg.resolved_dir(), "models")
+        os.makedirs(models_dir, exist_ok=True)
+        path = os.path.join(models_dir, "suite-{}-{}.json".format(
+            re.sub(r"[^A-Za-z0-9]", "", interval),
+            time.strftime("%Y%m%d-%H%M%S")))
+        write_json(path, summary, mode=0o600)
+        summary["path"] = path
+
+    if as_json:
+        print_json(summary)
+        return 0 if trained else 2
+
+    print()
+    print(" trained {} of {} selected · sufficient sample {} · beat baseline {} · "
+          "failed {}".format(len(trained), len(symbols), len(sufficient),
+                             len(beat), len(rows) - len(trained)))
+    print(" verdict: {}".format(summary["verdict"]))
+    if summary.get("path"):
+        print(" saved  : {}".format(summary["path"]))
+    print()
+    print(" A backtest is a hypothesis, not permission to trade. Live mode stays off.")
+    return 0 if trained else 2
+
+
 def cmd_verify_key(args: argparse.Namespace) -> int:
     cfg = build_config(args)
     engine = build_engine(cfg)
@@ -363,6 +596,29 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--label", help="short label appended to the saved model version")
     backtest.add_argument("--save", action="store_true", help="store the model version")
     backtest.set_defaults(func=cmd_backtest)
+
+    open_parser = sub.add_parser(
+        "open", aliases=["readme", "dashboard"],
+        help="start the terminal and open it in this device's browser")
+    open_parser.add_argument("--print-only", action="store_true",
+                             help="print the URL instead of launching a browser")
+    open_parser.set_defaults(func=cmd_serve, open_browser=True)
+
+    suite = sub.add_parser(
+        "train-suite", aliases=["train-all"],
+        help="train and evaluate a ranked batch of symbols (default 45)")
+    suite.add_argument("--count", type=int, default=45,
+                       help="how many symbols to train (default 45, max 200)")
+    suite.add_argument("--list", dest="symbol_list", default="",
+                       help="explicit comma-separated symbols instead of ranking")
+    suite.add_argument("--quote", default="USDT", help="quote asset (default USDT)")
+    suite.add_argument("--interval", default="1h")
+    suite.add_argument("--bars", type=int, default=1200)
+    suite.add_argument("--horizon", type=int, default=6)
+    suite.add_argument("--label", default="", help="label appended to saved versions")
+    suite.add_argument("--no-save", action="store_true",
+                       help="evaluate only, store no model files")
+    suite.set_defaults(func=cmd_train_suite)
 
     train = sub.add_parser("train", help="backtest and persist a model version")
     train.add_argument("symbol", nargs="?", help="Binance Spot symbol")

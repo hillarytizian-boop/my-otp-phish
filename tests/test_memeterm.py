@@ -42,6 +42,7 @@ from memeterm.risk import (MODE_DISCONNECTED, MODE_LIVE, MODE_PAPER,            
                            RiskEngine)
 from memeterm.secrets_store import CredentialError, SecretsStore                 # noqa: E402
 from memeterm.server import TerminalServer                                       # noqa: E402
+from memeterm.universe import describe_selection, select_symbols                 # noqa: E402
 from memeterm.store import StateStore                                            # noqa: E402
 from memeterm.util import (fingerprint, mask_key, parse_day_ms, redact)           # noqa: E402
 
@@ -729,6 +730,68 @@ class TestTelegram(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # 9. backtesting
 # ---------------------------------------------------------------------------
+class TestUniverse(unittest.TestCase):
+    """The ranker that decides which pairs `train-suite` touches."""
+
+    @staticmethod
+    def row(symbol, base, quote="USDT", status="TRADING", spot=True,
+            permissions=("SPOT",)):
+        return {"symbol": symbol, "baseAsset": base, "quoteAsset": quote,
+                "status": status, "isSpotTradingAllowed": spot,
+                "permissions": list(permissions)}
+
+    def test_filters_and_ranks_by_quote_volume(self):
+        info = {"symbols": [
+            self.row("AAAUSDT", "AAA"),
+            self.row("BBBUSDT", "BBB"),
+            self.row("CCCUSDT", "CCC"),
+            self.row("HALTUSDT", "HALT", status="BREAK"),
+            self.row("MARGINUSDT", "MARGIN", spot=False),
+            self.row("NOPERMUSDT", "NOPERM", permissions=("MARGIN",)),
+            self.row("ETHBTC", "ETH", quote="BTC"),
+            self.row("USDCUSDT", "USDC"),
+            self.row("BTCUPUSDT", "BTCUP"),
+            self.row("NOTICKERUSDT", "NOTICKER"),
+        ]}
+        tickers = [
+            {"symbol": "AAAUSDT", "quoteVolume": "100", "lastPrice": "1"},
+            {"symbol": "BBBUSDT", "quoteVolume": "900", "lastPrice": "2"},
+            {"symbol": "CCCUSDT", "quoteVolume": "400", "lastPrice": "3"},
+            {"symbol": "HALTUSDT", "quoteVolume": "9999", "lastPrice": "9"},
+            {"symbol": "MARGINUSDT", "quoteVolume": "9999", "lastPrice": "9"},
+            {"symbol": "NOPERMUSDT", "quoteVolume": "9999", "lastPrice": "9"},
+            {"symbol": "ETHBTC", "quoteVolume": "9999", "lastPrice": "9"},
+            {"symbol": "USDCUSDT", "quoteVolume": "9999", "lastPrice": "9"},
+            {"symbol": "BTCUPUSDT", "quoteVolume": "9999", "lastPrice": "9"},
+            {"symbol": "ZEROUSDT", "quoteVolume": "0", "lastPrice": "1"},
+        ]
+        result = select_symbols(info, tickers, count=10, quote="USDT")
+        self.assertEqual([row["symbol"] for row in result["symbols"]],
+                         ["BBBUSDT", "CCCUSDT", "AAAUSDT"])
+        self.assertEqual(result["skipped"]["not trading"], 1)
+        self.assertEqual(result["skipped"]["spot disabled"], 1)
+        self.assertEqual(result["skipped"]["no spot permission"], 1)
+        self.assertEqual(result["skipped"]["other quote asset"], 1)
+        self.assertEqual(result["skipped"]["stablecoin"], 1)
+        self.assertEqual(result["skipped"]["leveraged token"], 1)
+        self.assertEqual(result["skipped"]["no ticker data"], 1)
+        self.assertIn("USDT pairs", describe_selection(result))
+
+    def test_count_include_and_exclude(self):
+        info = {"symbols": [self.row("AAAUSDT", "AAA"), self.row("BBBUSDT", "BBB"),
+                            self.row("CCCUSDT", "CCC")]}
+        tickers = [{"symbol": "AAAUSDT", "quoteVolume": "300"},
+                   {"symbol": "BBBUSDT", "quoteVolume": "200"},
+                   {"symbol": "CCCUSDT", "quoteVolume": "100"}]
+        self.assertEqual(len(select_symbols(info, tickers, count=2)["symbols"]), 2)
+        only = select_symbols(info, tickers, count=10, include=["CCCUSDT"])
+        self.assertEqual([row["symbol"] for row in only["symbols"]], ["CCCUSDT"])
+        without = select_symbols(info, tickers, count=10, exclude=["AAAUSDT"])
+        self.assertEqual([row["symbol"] for row in without["symbols"]],
+                         ["BBBUSDT", "CCCUSDT"])
+        self.assertEqual(without["skipped"]["excluded by request"], 1)
+
+
 class TestBacktest(BaseCase):
     def candles(self, n: int = 600) -> List[Dict[str, Any]]:
         self.market_ready()
@@ -958,6 +1021,13 @@ class TestServer(BaseCase):
                                "end": "2026-01-01"}, headers)
         self.assertEqual(too_wide["code"], "BAD_WINDOW")
 
+    def test_probe_detects_a_running_terminal(self):
+        import meme_terminal as cli
+        server = self.start()
+        self.assertTrue(cli.probe_terminal(
+            "http://127.0.0.1:{}".format(server.port)))
+        self.assertFalse(cli.probe_terminal("http://127.0.0.1:1", timeout=0.3))
+
     def test_remote_mode_requires_access_code(self):
         server = TerminalServer(self.cfg, self.engine, host="0.0.0.0", port=0,
                                 quiet=True, access_code="test-code-123")
@@ -1031,6 +1101,47 @@ class TestCliSurface(unittest.TestCase):
                          ("2026-01-01", "2026-02-01", "v2"))
         train = parser.parse_args(["train", "ETHUSDT", "--label", "trend-v2"])
         self.assertEqual(train.label, "trend-v2")
+
+    def test_open_command_wiring(self):
+        import meme_terminal as cli
+        parser = cli.build_parser()
+        for name in ("open", "readme", "dashboard"):
+            args = parser.parse_args([name, "--print-only"])
+            self.assertTrue(args.open_browser, name)
+            self.assertTrue(args.print_only, name)
+        outcome = cli.launch_browser("http://127.0.0.1:8787", print_only=True)
+        self.assertFalse(outcome["opened"])
+        self.assertEqual(outcome["url"], "http://127.0.0.1:8787")
+        cfg = cli.TerminalConfig.load(data_dir=tempfile.mkdtemp())
+        self.assertEqual(cli.terminal_url(cfg.copy(host="0.0.0.0", port=9000)),
+                         "http://127.0.0.1:9000")
+        self.assertEqual(cli.terminal_url(cfg.copy(host="127.0.0.1", port=8787)),
+                         "http://127.0.0.1:8787")
+
+    def test_train_suite_runs_offline_in_demo_mode(self):
+        import contextlib
+        import io
+        import meme_terminal as cli
+        data_dir = tempfile.mkdtemp()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            listed = cli.main(["train-suite", "--demo", "--bars", "500",
+                               "--no-save", "--data-dir", data_dir,
+                               "--list", "BTCUSDT,ETHUSDT"])
+        output = buffer.getvalue()
+        self.assertEqual(listed, 0, output[-800:])
+        self.assertIn("training 2 symbols", output)
+        self.assertIn("trained 2 of 2", output)
+        self.assertIn("Live mode stays off", output)
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            ranked = cli.main(["train-suite", "--demo", "--count", "1", "--bars", "500",
+                               "--no-save", "--data-dir", data_dir])
+        output = buffer.getvalue()
+        self.assertEqual(ranked, 0, output[-800:])
+        self.assertIn("ranked by 24h quote volume", output)
+        self.assertIn("trained 1 of 1", output)
 
     def test_globals_may_follow_the_subcommand(self):
         import meme_terminal as cli

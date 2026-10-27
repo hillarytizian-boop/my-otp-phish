@@ -39,7 +39,7 @@ pkg update && pkg upgrade -y
 pkg install -y python
 cd ~/my-otp-phish          # the cloned repository
 python meme_terminal.py --version
-python meme_terminal.py selftest      # 62 offline tests, no network, ~8 s
+python meme_terminal.py selftest      # 67 offline tests, no network, ~9 s
 ```
 
 No pip packages, no compiler, no `solders`. The browser UI is three static files
@@ -71,6 +71,24 @@ Useful variants:
 python meme_terminal.py serve --port 9000          # different port
 python meme_terminal.py serve --demo               # synthetic data, clearly labelled
 python meme_terminal.py serve --allow-remote --host 0.0.0.0   # LAN / preview proxy
+```
+
+### One command that opens the dashboard
+
+```bash
+python meme_terminal.py open          # readme / dashboard are aliases
+```
+
+`open` starts the server **and** launches the URL in this device's browser
+(`termux-open-url` first, then `am start`, then `xdg-open`/`open`, then Python's
+`webbrowser`). The URL is always printed, so a device with no browser handler
+still tells you where to go. If a terminal is already listening on that port,
+`open` detects it through `/api/health` and just opens the browser instead of
+starting a second server.
+
+```bash
+python meme_terminal.py open --print-only      # print the URL, launch nothing
+python meme_terminal.py open --demo --port 9000
 ```
 
 `--allow-remote` prints a one-time **access code**. The dashboard then asks for
@@ -174,6 +192,31 @@ python meme_terminal.py backtest ETHUSDT --interval 1h \
 python meme_terminal.py train ETHUSDT --interval 1h --bars 1400 --save --label trend-v2
 ```
 
+### Train a batch of 45 symbols
+
+```bash
+python meme_terminal.py train-suite                  # top 45 USDT pairs by 24h volume
+python meme_terminal.py train-suite --count 45 --interval 1h --bars 1200
+python meme_terminal.py train-suite --list BTCUSDT,ETHUSDT,SOLUSDT --no-save
+python meme_terminal.py train-suite --demo --count 3 # offline demo feed (5 pairs max)
+```
+
+`train-suite` builds its universe from `exchangeInfo` + `ticker/24hr` and keeps
+only symbols that are `TRADING`, spot-enabled, quoted in the requested asset, not
+stablecoins and not leveraged tokens (BTCUP/DOWN/BULL/BEAR), then ranks by 24h
+quote volume. Everything else is counted in a `skipped` map that is printed and
+saved, so the filter is auditable rather than magic.
+
+> Binance **Spot** lists crypto pairs, not equities - there are no stocks to
+> train on this exchange. The default universe is the 45 most liquid USDT pairs;
+> use `--list` for an exact set.
+
+Output is a per-symbol table (bars, trades, net %, expectancy, sample verdict,
+baseline verdict) followed by a one-line verdict, plus
+`models/suite-<interval>-<stamp>.json` with every row and the skip counts.
+One symbol failing never aborts the batch; its row carries the error. A run
+where nothing beat the baseline says exactly that - it never claims a strategy.
+
 `--start` and `--end` must be given together as `YYYY-MM-DD`; the range wins
 over `--bars` and is trimmed exactly to the window. Bad dates exit with status
 `2` and a one-line reason (`--end must be after --start`, `bad date: ...`,
@@ -233,11 +276,13 @@ strategy.
 
 ```bash
 python meme_terminal.py serve              # dashboard + engine
+python meme_terminal.py open               # serve + open this device's browser
 python meme_terminal.py status             # state summary in the terminal
 python meme_terminal.py agents BTCUSDT     # run 100 agents once
 python meme_terminal.py registry           # list all 100 roles
 python meme_terminal.py backtest BTCUSDT --interval 15m --bars 1500
 python meme_terminal.py train BTCUSDT --interval 1h --bars 3000 --save
+python meme_terminal.py train-suite        # train the top 45 USDT pairs
 python meme_terminal.py verify-key         # read-only key/permission check
 python meme_terminal.py selftest           # offline test suite
 ```
@@ -306,8 +351,9 @@ memeterm/
   notify.py             optional Telegram with de-duplication
   server.py             HTTP API, security headers, CSRF, static UI
   demo.py               synthetic data for offline evaluation (cannot trade)
+  universe.py           which symbols are tradable/liquid enough to train on
   web/                  index.html, app.js, styles.css (no build step)
-tests/test_memeterm.py  62 offline tests
+tests/test_memeterm.py  67 offline tests
 ```
 
 ## 12. Warning
