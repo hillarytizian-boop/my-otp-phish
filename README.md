@@ -61,7 +61,7 @@ saves `state.json`, the next start resumes with the same portfolio.
 ```bash
 cd ~/my-otp-phish
 git pull
-python meme_agents.py --selftest     # 101 checks, must pass before you run it
+python meme_agents.py --selftest     # 150 checks, must pass before you run it
 python meme_agents.py
 ```
 
