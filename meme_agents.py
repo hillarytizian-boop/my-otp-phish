@@ -59,7 +59,22 @@ RUN (paper mode, the default)
   python meme_agents.py
   python meme_agents.py --free-run-hours 24      # 24h forward paper test
   python meme_agents.py --analyze                # did the signals actually pay?
+  python meme_agents.py --research-check BONK    # test the optional browser skill
   python meme_agents.py --selftest               # offline test suite, no network
+
+WEB RESEARCH SKILL (optional, needs the `obscura` headless browser)
+-------------------------------------------------------------------
+  Before any signal is emitted, and every ~5 minutes for open positions, the bot
+  opens public pages with Obscura and looks for the ticker: DexScreener page,
+  DuckDuckGo, Bing, Google News, Reddit, public t.me channels (+ x.com search if
+  a cookie jar is configured).
+    * bad news ("honeypot", "rug", "exploit"...) on 2+ pages -> veto the buy,
+      and exit an open position immediately
+    * clean chatter -> at most +5 momentum points (never enough on its own)
+    * no browser installed, login wall, timeout -> "unavailable"; by default the
+      price rules decide alone, with --research-required nothing trades blind.
+  Verify it first:  python meme_agents.py --research-check BONK
+  Install notes and the Termux/proot caveat: README section 1b.
 
 RUNNING IT ALL DAY
 ------------------
@@ -120,7 +135,9 @@ import math
 import os
 import random
 import re
+import shutil
 import signal
+import subprocess
 import sys
 import time
 import traceback
@@ -132,7 +149,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # --- well-known Solana mints -------------------------------------------------
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -362,6 +379,25 @@ class Config:
     heartbeat_every_s: float = 10.0      # for external watchdogs
     state_enabled: bool = True
     stale_price_alert_s: float = 300.0
+
+    # ---- web research (Obscura headless browser, optional) --------------------
+    research_enabled: bool = True             # auto-disables when the binary is missing
+    obscura_bin: str = ""                     # empty = $OBSCURA_BIN, PATH, ./obscura
+    research_stealth: bool = True             # consistent fingerprint + tracker blocking
+    research_obey_robots: bool = False        # polite mode: obey robots.txt per site
+    research_timeout_s: float = 25.0          # hard cap for one token's whole lookup
+    research_min_interval_s: float = 2.5      # between browser launches (one core phone)
+    research_concurrency: int = 1
+    research_cache_ttl_s: float = 900.0       # per source URL
+    research_max_sources: int = 3             # 3 browser launches per candidate, max
+    research_required: bool = False           # True = no research, no trade
+    research_boost_points: float = 5.0        # score bonus for confirmed chatter
+    research_boost_min_mentions: int = 4
+    research_scam_veto_hits: int = 4
+    research_scam_min_sources: int = 2
+    research_position_interval_s: float = 300.0
+    research_channels: str = ""               # comma-separated public t.me channels
+    research_storage_dir: str = ""            # cookie jar (env OBSCURA_STORAGE_DIR too)
 
     # ---- autonomous paper test ----------------------------------------------
     free_run_hours: float = 0.0                 # >0 = stop after N hours and report
@@ -1641,6 +1677,392 @@ def momentum_score(snap: Optional[MarketSnapshot], micro: Optional[MicroStats],
     return MomentumResult(round(score, 2), comps, weights, veto, notes)
 
 
+
+# =============================================================================
+# SECTION 8b.  WEB RESEARCH SKILL  (Obscura headless browser, optional)
+#
+# The question this answers: "is anything being said about this token right now,
+# and is any of it bad?" A momentum score only sees prices. A token can be
+# pumping while Twitter, Reddit and the news are full of "rug", "honeypot" or
+# "exploit" - that is the one thing a chart cannot show you.
+#
+# HOW IT IS USED (both directions, never as a promise):
+#   * before a buy, a veto-grade news signal rejects the candidate
+#     (reason starts with "research_veto"), and confirmed chatter can add a few
+#     points - it can never turn a weak setup into a strong one on its own;
+#   * while holding, a veto-grade news signal triggers an immediate exit.
+#
+# HONEST LIMITS (also in README):
+#   * X/Twitter shows a login wall to logged-out browsers; without a cookie jar
+#     (--research-storage-dir) the X source returns "blocked", and this code
+#     says so instead of inventing a sentiment score.
+#   * keyword matching is dumb. "not a rug" and "rug" look the same to it. That
+#     is why one mention never vetoes and two independent sources are required.
+#   * Obscura launches a browser per source. On a phone that costs seconds, so
+#     this runs only at the confirmation stage (rare) and while holding, never
+#     in the discovery loop.
+#   * It is not faster than the market. News you can scrape at 25 seconds is
+#     often already priced in, and a bot is the last to know.
+#
+# INSTALL (see README): official builds need glibc 2.35+, so on Android run it
+# inside proot-distro (Ubuntu) and point OBSCURA_BIN at a wrapper script.
+# =============================================================================
+
+OBSCURA_BIN_ENV = "OBSCURA_BIN"
+OBSCURA_STORAGE_ENV = "OBSCURA_STORAGE_DIR"
+
+# Words that, on a line that also names the token, are bad news.
+SCAM_WORDS = (
+    "rug", "rugged", "rugpull", "rug pull", "honeypot", "honey pot", "scam",
+    "exploit", "hacked", "hack", "stolen", "drained", "drainer", "blacklist",
+    "blacklisted", "frozen", "cannot sell", "can't sell", "suspicious", "ponzi",
+    "fake", "abandoned", "exit scam", "malicious", "phishing", "do not buy",
+    "stay away", "warning",
+)
+# Words that are mildly positive, only counted together with real mentions.
+HYPE_WORDS = (
+    "listing", "listed", "partnership", "airdropping", "trending", "breaking out",
+    "all-time high", "ath", "buyback", "burn", "liquidity locked", "revived",
+    "accumulating", "whale buying", "just launched",
+)
+# A bare ticker is only a mention when the same line is about crypto.
+CONTEXT_WORDS = (
+    "solana", "sol ", "spl", "token", "coin", "mint", "dexscreener", "raydium",
+    "pump.fun", "pumpfun", "jupiter", "chart", "liquidity", "memecoin", "meme coin",
+)
+BLOCKED_PAGE_MARKERS = (
+    "sign in to x", "log in to x", "enable javascript", "are you a robot",
+    "verify you are human", "captcha", "access denied", "unusual traffic",
+    "login required", "sign in to continue",
+)
+
+
+@dataclass
+class FetchResult:
+    """One browser fetch. Never raises: failures are data, not exceptions."""
+    ok: bool = False
+    url: str = ""
+    text: str = ""
+    error: str = ""
+    ms: float = 0.0
+    blocked: bool = False
+    from_cache: bool = False
+
+
+@dataclass
+class Mentions:
+    """What one page said about one token."""
+    mentions: int = 0
+    strong: int = 0
+    scam_hits: int = 0
+    hype_hits: int = 0
+    samples: List[str] = field(default_factory=list)
+    scam_samples: List[str] = field(default_factory=list)
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"mentions": self.mentions, "strong": self.strong,
+                "scam_hits": self.scam_hits, "hype_hits": self.hype_hits,
+                "samples": self.samples, "scam_samples": self.scam_samples}
+
+
+@dataclass
+class ResearchResult:
+    """Aggregate verdict over every source that answered."""
+    verdict: str = "unavailable"      # boost | neutral | veto | unavailable | disabled | timeout
+    delta: float = 0.0                # score points added (boost only)
+    mentions: int = 0
+    scam_hits: int = 0
+    hype_hits: int = 0
+    sources_ok: int = 0
+    sources_tried: int = 0
+    blocked: int = 0
+    summary: str = ""
+    per_source: Dict[str, Any] = field(default_factory=dict)
+    notes: List[str] = field(default_factory=list)
+
+    def line(self) -> str:
+        return "{} | {} | {} sources, {} mentions, {} scam, {} hype".format(
+            self.verdict.upper(), self.summary or "-", self.sources_ok,
+            self.mentions, self.scam_hits, self.hype_hits)
+
+
+def _has_context(low: str) -> bool:
+    return any(word in low for word in CONTEXT_WORDS)
+
+
+def research_mentions(text: str, symbol: str, mint: str = "") -> Mentions:
+    """
+    Count how loudly one page talks about this token, line by line.
+
+    A mention is: the mint address, a $CASHTAG, or a bare ticker on a line that
+    also contains a crypto word. Scam/hype keywords only count on those same
+    lines, so a page about an unrelated rug cannot veto your trade.
+    """
+    out = Mentions()
+    sym = (symbol or "").strip().upper()
+    mint = (mint or "").strip()
+    if not text or (not sym and not mint):
+        return out
+    cashtag = re.compile(r"[$#]" + re.escape(sym) + r"\b", re.IGNORECASE) if sym else None
+    bare = re.compile(r"\b" + re.escape(sym) + r"\b", re.IGNORECASE) if sym else None
+    seen = set()
+    for raw in text.splitlines():
+        line = " ".join(raw.split())
+        if not line or len(line) < 4:
+            continue
+        low = line.lower()
+        tagged = bool(cashtag and cashtag.search(line))
+        bare_hit = bool(bare and bare.search(line)) and _has_context(low)
+        mint_hit = bool(mint) and mint.lower() in low
+        if not (tagged or bare_hit or mint_hit):
+            continue
+        out.mentions += 1
+        if tagged or mint_hit:
+            out.strong += 1
+        hits_here = sum(1 for word in SCAM_WORDS if word in low)
+        out.scam_hits += hits_here
+        out.hype_hits += sum(1 for word in HYPE_WORDS if word in low)
+        if hits_here and line not in seen and len(out.scam_samples) < 6:
+            seen.add(line)
+            out.scam_samples.append(line[:160])
+        elif line not in seen and len(out.samples) < 6:
+            seen.add(line)
+            out.samples.append(line[:160])
+    return out
+
+
+def research_sources(cfg: Config, symbol: str, mint: str = "") -> List[Dict[str, str]]:
+    """
+    Where to look. Public, no-login pages first; X needs cookies so it is only
+    included when a storage directory is configured. Ordered by usefulness.
+    """
+    sym = (symbol or "").strip()
+    query = urllib.parse.quote_plus('"${}" solana'.format(sym) if sym else mint)
+    out: List[Dict[str, str]] = []
+    if sym or mint:
+        out.append({"name": "dexscreener",
+                    "url": "https://dexscreener.com/solana/{}".format(mint or sym),
+                    "dump": "markdown", "own": "1"})
+        out.append({"name": "duckduckgo",
+                    "url": "https://html.duckduckgo.com/html/?q=" + query,
+                    "dump": "markdown"})
+        out.append({"name": "bing",
+                    "url": "https://www.bing.com/search?q=" + query,
+                    "dump": "markdown"})
+        out.append({"name": "google_news",
+                    "url": "https://news.google.com/rss/search?q=" + query,
+                    "dump": "original"})
+        out.append({"name": "reddit",
+                    "url": "https://old.reddit.com/search?q=" + query + "&sort=new&t=week",
+                    "dump": "markdown"})
+        if cfg.research_storage_dir or os.environ.get(OBSCURA_STORAGE_ENV):
+            out.append({"name": "x_search",
+                        "url": "https://x.com/search?q=" + query + "&f=live",
+                        "dump": "markdown"})
+        for channel in [c.strip() for c in (cfg.research_channels or "").split(",") if c.strip()]:
+            out.append({"name": "telegram:" + channel[:20],
+                        "url": "https://t.me/s/" + channel.strip().lstrip("@"),
+                        "dump": "markdown"})
+    return out[: max(1, int(cfg.research_max_sources))]
+
+
+def research_verdict(per_source: Dict[str, Dict[str, Any]], cfg: Config) -> ResearchResult:
+    """
+    Combine per-source mention counts into one decision.
+
+    Deliberately conservative:
+      * veto needs either >= research_scam_min_sources independent pages with a
+        scam word on a token line, or >= research_scam_veto_hits total hits;
+      * a boost needs real chatter with zero scam words;
+      * one silent page is never evidence of anything, so "no sources answered"
+        reports "unavailable" instead of a fake neutral.
+    """
+    res = ResearchResult(sources_tried=len(per_source))
+    notes: List[str] = []
+    scam_sources = 0
+    for name, data in per_source.items():
+        if not isinstance(data, dict) or not data.get("ok"):
+            if isinstance(data, dict) and data.get("blocked"):
+                res.blocked += 1
+            continue
+        res.sources_ok += 1
+        res.mentions += int(fnum(data.get("mentions")))
+        res.scam_hits += int(fnum(data.get("scam_hits")))
+        res.hype_hits += int(fnum(data.get("hype_hits")))
+        if int(fnum(data.get("scam_hits"))) > 0:
+            scam_sources += 1
+            samples = data.get("scam_samples") or data.get("samples") or []
+            if samples:
+                notes.append("{}: {}".format(name, samples[0][:130]))
+    res.per_source = per_source
+    res.notes = notes
+
+    if res.sources_ok == 0:
+        res.verdict = "unavailable"
+        res.summary = ("no source answered ({}/{} blocked)".format(res.blocked, res.sources_tried)
+                       if res.sources_tried else "no sources configured")
+        return res
+
+    if (scam_sources >= max(1, int(cfg.research_scam_min_sources))
+            or res.scam_hits >= max(1, int(cfg.research_scam_veto_hits))):
+        res.verdict = "veto"
+        res.summary = "bad news on {}/{} pages ({} hits): {}".format(
+            scam_sources, res.sources_ok, res.scam_hits,
+            notes[0][:110] if notes else "scam keywords next to the token")
+    elif res.scam_hits == 0 and res.mentions >= cfg.research_boost_min_mentions and res.hype_hits >= 1:
+        res.verdict = "boost"
+        res.delta = cfg.research_boost_points
+        res.summary = "{} mentions, {} hype words, no scam words".format(
+            res.mentions, res.hype_hits)
+    else:
+        res.verdict = "neutral"
+        res.summary = "{} mentions, {} scam, {} hype".format(
+            res.mentions, res.scam_hits, res.hype_hits)
+    return res
+
+
+def _blocked_page(text: str) -> bool:
+    low = text.lower()
+    return any(marker in low for marker in BLOCKED_PAGE_MARKERS) and len(text) < 20000
+
+
+class Obscura:
+    """
+    Thin, rate-limited, cached wrapper around the `obscura` CLI.
+
+    One browser launch at a time by default: this is meant to run on a phone
+    while 100 asyncio agents are working. Every failure mode returns a
+    FetchResult with ok=False; nothing here can crash the swarm.
+    """
+
+    def __init__(self, cfg: Config, runner: Optional[Callable[[List[str], float], Tuple[int, str, str]]] = None):
+        self.cfg = cfg
+        self._runner = runner or self._subprocess_runner
+        self._cache: Dict[str, Tuple[float, FetchResult]] = {}
+        self._sem = asyncio.Semaphore(max(1, int(cfg.research_concurrency)))
+        self._pace_lock = asyncio.Lock()
+        self._last_launch = 0.0
+        self.bin = self.locate()
+        self.stats = {"fetches": 0, "ok": 0, "errors": 0, "cache_hits": 0,
+                      "timeouts": 0, "blocked": 0, "launches": 0}
+
+    # ---------------------------------------------------------------- discovery
+    def locate(self) -> str:
+        for candidate in (self.cfg.obscura_bin, os.environ.get(OBSCURA_BIN_ENV, "")):
+            candidate = (candidate or "").strip()
+            if candidate and os.path.exists(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        found = shutil.which("obscura")
+        if found:
+            return found
+        local = os.path.join(os.getcwd(), "obscura")
+        if os.path.exists(local) and os.access(local, os.X_OK):
+            return local
+        return ""
+
+    @property
+    def available(self) -> bool:
+        return bool(self.bin) and bool(self.cfg.research_enabled)
+
+    def storage_dir(self) -> str:
+        return (self.cfg.research_storage_dir
+                or os.environ.get(OBSCURA_STORAGE_ENV, "")).strip()
+
+    def command(self, url: str, dump: str = "markdown") -> List[str]:
+        args = [self.bin or "obscura", "fetch", url, "--dump", dump, "--quiet",
+                "--timeout", "{:.0f}".format(max(5.0, self.cfg.research_timeout_s))]
+        if self.cfg.research_stealth:
+            args.append("--stealth")
+        if self.cfg.research_obey_robots:
+            args.append("--obey-robots")
+        if self.storage_dir():
+            args += ["--storage-dir", self.storage_dir()]
+        return args
+
+    @staticmethod
+    def _subprocess_runner(args: List[str], timeout: float) -> Tuple[int, str, str]:
+        """Blocking; always called through asyncio.to_thread."""
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                                  errors="replace")
+            return proc.returncode, proc.stdout or "", (proc.stderr or "").strip()[-400:]
+        except subprocess.TimeoutExpired:
+            return 124, "", "timeout after {:.0f}s".format(timeout)
+        except OSError as exc:
+            return 127, "", str(exc)[:200]
+
+    # ------------------------------------------------------------------- fetch
+    async def fetch(self, url: str, dump: str = "markdown") -> FetchResult:
+        if not self.available:
+            return FetchResult(url=url, error="obscura not installed or research disabled")
+        now = time.time()
+        cached = self._cache.get(url)
+        if cached and now - cached[0] < self.cfg.research_cache_ttl_s:
+            self.stats["cache_hits"] += 1
+            hit = replace(cached[1], from_cache=True)
+            return hit
+        args = self.command(url, dump)
+        timeout = max(10.0, self.cfg.research_timeout_s + 15.0)
+        started = time.time()
+        async with self._sem:
+            async with self._pace_lock:
+                wait = self.cfg.research_min_interval_s - (time.time() - self._last_launch)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self._last_launch = time.time()
+                self.stats["launches"] += 1
+            try:
+                rc, out, err = await asyncio.to_thread(self._runner, args, timeout)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:                      # noqa: BLE001 - never crash the swarm
+                rc, out, err = 1, "", str(exc)[:200]
+        ms = (time.time() - started) * 1000.0
+        text = (out or "").strip()
+        self.stats["fetches"] += 1
+        if rc != 0 or not text:
+            if rc == 124:
+                self.stats["timeouts"] += 1
+            else:
+                self.stats["errors"] += 1
+            result = FetchResult(url=url, error=(err or "empty page")[:200], ms=ms)
+        elif _blocked_page(text):
+            self.stats["blocked"] += 1
+            result = FetchResult(url=url, blocked=True, ms=ms,
+                                 error="login/captcha wall", text=text[:2000])
+        else:
+            self.stats["ok"] += 1
+            result = FetchResult(url=url, ok=True, text=text[:400000], ms=ms)
+        self._cache[url] = (time.time(), result)
+        return result
+
+    async def fetch_many(self, sources: Sequence[Dict[str, str]]) -> Dict[str, FetchResult]:
+        """Fetch every source in parallel (bounded by research_concurrency)."""
+        tasks = {src["name"]: asyncio.create_task(self.fetch(src["url"], src.get("dump", "markdown")))
+                 for src in sources}
+        out: Dict[str, FetchResult] = {}
+        for name, task in tasks.items():
+            try:
+                out[name] = await asyncio.wait_for(
+                    task, timeout=self.cfg.research_timeout_s + 20.0)
+            except asyncio.TimeoutError:
+                out[name] = FetchResult(error="timeout")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:                      # noqa: BLE001
+                out[name] = FetchResult(error=str(exc)[:200])
+        return out
+
+    def status_line(self) -> str:
+        if not self.cfg.research_enabled:
+            return "research: disabled"
+        if not self.bin:
+            return "research: unavailable (no obscura binary; see README)"
+        return ("research: {} | {} ok, {} err, {} blocked, {} cache hits").format(
+            self.bin, self.stats["ok"], self.stats["errors"],
+            self.stats["blocked"], self.stats["cache_hits"])
+
+
 # =============================================================================
 # SECTION 9.  EXIT RULES (take profit / trailing / stops)
 # =============================================================================
@@ -2329,6 +2751,8 @@ SOURCE_LIST = [
     "RugCheck     /v1/tokens/{mint}/report (authorities, LP lock, holders, creator, risks)",
     "Jupiter      /swap/v1/quote (honeypot route check in paper; real swaps in live)",
     "Telegram     outbound alerts only (no market data)",
+    "Obscura      OPTIONAL web research via a headless browser: DuckDuckGo, Bing,",
+    "             Google News, Reddit, DexScreener page, public t.me channels",
 ]
 
 
@@ -2365,6 +2789,11 @@ class Swarm:
         self.recent_events: List[str] = []
         self.report_written = False
         self._alerted: Dict[str, float] = {}
+        self.obscura = Obscura(cfg)
+        self._research_cache: Dict[str, Tuple[float, ResearchResult]] = {}
+        self.research_runs = 0
+        self.research_vetoes = 0
+        self.research_boosts = 0
 
     # ------------------------------------------------------------------ helper
     def note(self, text: str) -> None:
@@ -2399,6 +2828,9 @@ class Swarm:
             "trail {:.0f}%->{:.0f}%".format(
                 self.cfg.stop_loss_pct, self.cfg.tp1_pct, self.cfg.tp1_frac * 100,
                 self.cfg.tp2_pct, self.cfg.tp2_frac * 100, self.cfg.trail_pct, self.cfg.trail_tight_pct),
+            " web research     : " + (self.obscura.status_line()[10:]
+                                      if self.obscura.status_line().startswith("research: ")
+                                      else self.obscura.status_line()),
             " signal quality   : momentum>={:.0f} | {}+ providers | 2nd look after {:.0f}s | "
             "tape>={} trades, {} buyers, {} volume".format(
                 self.cfg.momentum_threshold, self.cfg.min_corroboration,
@@ -2626,6 +3058,120 @@ class Swarm:
                 log.error("%s crashed on %s: %s", agent, short_addr(mint), exc)
                 log.debug("%s", traceback.format_exc())
 
+    # ---------------------------------------------------------------- research
+    async def research(self, mint: str, symbol: str, name: str = "") -> ResearchResult:
+        """
+        Ask the open web about one token, with a hard time budget.
+
+        Every failure is non-fatal: no binary, no network, login walls and
+        timeouts all come back as a verdict the caller can reason about rather
+        than an exception. Results are cached per token for research_cache_ttl_s
+        so holding a position does not re-launch a browser every 5 minutes.
+        """
+        if not self.cfg.research_enabled:
+            return ResearchResult(verdict="disabled", notes=["research disabled"])
+        if not self.obscura.available:
+            return ResearchResult(verdict="unavailable",
+                                  notes=["obscura binary not found (see README)"])
+        key = mint or symbol
+        hit = self._research_cache.get(key)
+        if hit and time.time() - hit[0] < self.cfg.research_cache_ttl_s:
+            return hit[1]
+
+        async def gather() -> ResearchResult:
+            sources = research_sources(self.cfg, symbol, mint)
+            pages = await self.obscura.fetch_many(sources)
+            per: Dict[str, Dict[str, Any]] = {}
+            for src in sources:
+                got = pages.get(src["name"]) or FetchResult(error="no result")
+                if not got.ok:
+                    per[src["name"]] = {"ok": False, "blocked": got.blocked,
+                                        "error": got.error}
+                    continue
+                counts = research_mentions(got.text, symbol, mint).as_dict()
+                if src.get("own"):
+                    # The token's own DEX page repeats the ticker by design. Its
+                    # warnings are worth counting; its "mentions" are not chatter.
+                    counts["mentions"] = 0
+                    counts["hype_hits"] = 0
+                    counts["samples"] = []
+                per[src["name"]] = dict(counts, ok=True)
+            return research_verdict(per, self.cfg)
+
+        self.research_runs += 1
+        try:
+            result = await asyncio.wait_for(gather(), timeout=self.cfg.research_timeout_s)
+        except asyncio.TimeoutError:
+            result = ResearchResult(verdict="timeout",
+                                    notes=["research exceeded {:.0f}s".format(
+                                        self.cfg.research_timeout_s)])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:                          # noqa: BLE001 - never fatal
+            log.debug("research failed for %s: %s", symbol, exc)
+            result = ResearchResult(verdict="unavailable", notes=[str(exc)[:160]])
+
+        self._research_cache[key] = (time.time(), result)
+        if len(self._research_cache) > 500:
+            for old_key in list(self._research_cache)[:100]:
+                self._research_cache.pop(old_key, None)
+        if result.verdict == "veto":
+            self.research_vetoes += 1
+        elif result.verdict == "boost":
+            self.research_boosts += 1
+        await self.ledger.record(
+            "RESEARCH", agent="research", mint=mint, symbol=symbol,
+            reason=result.line()[:250],
+            detail="; ".join((result.notes or [])[:3])[:400])
+        self.note("RESEARCH {} {}".format(symbol, result.verdict))
+        return result
+
+    async def research_gate(self, mint: str, symbol: str,
+                            name: str = "") -> Tuple[Optional[ResearchResult], str]:
+        """
+        Returns (result, rejection_reason). Empty reason = allowed through.
+        Only a veto (or missing research when research_required) blocks.
+        """
+        result = await self.research(mint, symbol, name)
+        if result.verdict == "veto":
+            return result, "research_veto: " + result.summary
+        if self.cfg.research_required and result.verdict not in ("boost", "neutral"):
+            return result, "research_unavailable: " + result.summary
+        return result, ""
+
+    async def news_watch_loop(self) -> None:
+        """
+        Bad news on a token you already hold is worse than a stop loss is late.
+        Runs rarely (default every 5 min), only for open positions, and exits
+        through the same _close_one() path as every other emergency.
+        """
+        while not self.stop_event.is_set():
+            await self._sleep(self.cfg.research_position_interval_s)
+            if self.stop_event.is_set():
+                return
+            if not self.obscura.available or self.draining:
+                continue
+            for pos in self.pf.open_positions():
+                if pos.locked:
+                    continue
+                try:
+                    result = await self.research(pos.mint, pos.symbol)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:                  # noqa: BLE001
+                    log.debug("news watch failed for %s: %s", pos.symbol, exc)
+                    continue
+                if result.verdict != "veto":
+                    continue
+                log.warning("NEWS VETO on held position %s: %s", pos.symbol, result.summary)
+                self.tg.notify("[{}] BAD NEWS EXIT {}\n{}\nclosing the position now.".format(
+                    "LIVE" if self.cfg.live else "PAPER", pos.symbol, result.summary))
+                pos.locked = True
+                try:
+                    await self._close_one(pos, "bad news (research): " + result.summary[:160])
+                finally:
+                    pos.locked = False
+
     # ------------------------------------------------------------ confirmation
     async def _confirm_candidate(self, mint: str, entry: Dict[str, Any]) -> None:
         """
@@ -2681,16 +3227,36 @@ class Swarm:
 
         if self.draining or self.stop_event.is_set():
             return
+
+        # ---- the web research skill: last gate before a signal exists --------
+        research, why = await self.research_gate(mint, symbol, getattr(snap, "name", ""))
+        if why:
+            await self._confirm_reject(mint, symbol, why, agent)
+            return
+        score = res.score
+        if research is not None and research.delta:
+            score = clip(score + research.delta, 0.0, 100.0)
+            if score < self.cfg.momentum_threshold:
+                await self._confirm_reject(
+                    mint, symbol, "confirm_momentum_lost after research ({:.1f} < {:.1f})".format(
+                        score, self.cfg.momentum_threshold), agent)
+                return
+        if self.stop_event.is_set():
+            return
+
         await self.ledger.record(
             "SIGNAL", agent=agent, mint=mint, symbol=symbol, price=snap.price_usd,
             reason="confirmed after {:.0f}s".format(now - entry["first_seen"]),
-            detail="momentum {:.1f} (first {:.1f}) | held {:.0f}s | {}".format(
-                res.score, entry["score"], now - entry["first_seen"],
+            detail="momentum {:.1f} (first {:.1f}) | held {:.0f}s | research {} | {}".format(
+                score, entry["score"], now - entry["first_seen"],
+                research.line()[:120] if research else "off",
                 " ".join("{}={:.0f}".format(k, v) for k, v in res.components.items())),
-            score=res.score)
-        self.note("SIGNAL {} {:.0f} (confirmed)".format(symbol, res.score))
+            score=score)
+        self.note("SIGNAL {} {:.0f} (confirmed{})".format(
+            symbol, score, ", +{:+.0f} news".format(research.delta) if research and research.delta else ""))
         await self.signals.put({"mint": mint, "symbol": symbol, "snap": snap, "facts": facts,
-                                "micro": micro, "score": res.score,
+                                "micro": micro, "score": score,
+                                "research": research.line()[:160] if research else "",
                                 "source": item.get("source", ""), "agent": agent,
                                 "ts": time.time()})
 
@@ -2702,14 +3268,18 @@ class Swarm:
         self.blocked[mint] = time.time() + self.cfg.cooldown_after_reject_s
 
     async def confirmation_loop(self) -> None:
-        while not self.stop_event.is_set():
-            now = time.time()
-            for mint, entry in list(self.pending.items()):
-                if entry["due"] > now:
-                    continue
-                self.pending.pop(mint, None)
-                if self.draining or mint in self.pf.open_mints():
-                    continue
+        """
+        Second looks run concurrently but bounded: each one can spend up to
+        research_timeout_s inside a browser, and a single slow lookup must not
+        stall every other candidate.
+        """
+        running: set = set()
+        sem = asyncio.Semaphore(2)
+
+        async def one(mint: str, entry: Dict[str, Any]) -> None:
+            async with sem:
+                if self.draining or self.stop_event.is_set() or mint in self.pf.open_mints():
+                    return
                 try:
                     await self._confirm_candidate(mint, entry)
                 except asyncio.CancelledError:
@@ -2717,11 +3287,24 @@ class Swarm:
                 except Exception as exc:
                     log.error("confirmation failed for %s: %s", short_addr(mint), exc)
                     log.debug("%s", traceback.format_exc())
-            if len(self.pending) > 0:                     # expire stale first looks
-                for mint, entry in list(self.pending.items()):
-                    if now - entry["first_seen"] > 600:
-                        self.pending.pop(mint, None)
+
+        while not self.stop_event.is_set():
+            now = time.time()
+            for mint, entry in list(self.pending.items()):
+                if entry["due"] > now:
+                    continue
+                self.pending.pop(mint, None)
+                if len(running) >= 4:                     # bounded backlog
+                    continue
+                task = asyncio.create_task(one(mint, entry))
+                running.add(task)
+                task.add_done_callback(running.discard)
+            for mint, entry in list(self.pending.items()):   # expire stale first looks
+                if now - entry["first_seen"] > 600:
+                    self.pending.pop(mint, None)
             await self._sleep(2.0)
+        for task in list(running):
+            task.cancel()
 
     # ------------------------------------------------------------------ entries
     async def try_open(self, sig: Dict[str, Any], agent: str) -> None:
@@ -2779,7 +3362,9 @@ class Swarm:
                 qty=fill.qty_tokens, price=fill.price, usd=fill.usd_value, fee_usd=fill.fee_usd,
                 pos_id=pos.pos_id, score=fnum(sig.get("score")),
                 reason="momentum {:.0f}".format(fnum(sig.get("score"))),
-                detail="slippage {:.0f}bps; {}".format(fill.slippage_bps, fill.detail))
+                detail="slippage {:.0f}bps; {}{}".format(
+                    fill.slippage_bps, fill.detail,
+                    ("; research " + str(sig.get("research")))[:200] if sig.get("research") else ""))
             self.tg.notify("[{}] BUY {} ${:.2f} @ {:.10g}\nmomentum {:.0f} | liq {}\n{}"
                            .format("LIVE" if self.cfg.live else "PAPER", symbol,
                                    fill.usd_value, fill.price, fnum(sig.get("score")),
@@ -3122,6 +3707,11 @@ class Swarm:
         lines.append(" feeds: " + " | ".join(
             "{} ok{} err{}".format(n.split(":")[0][:11], s["ok"], s["err"])
             for n, s in self.feed_state.items()))
+        if self.cfg.research_enabled:
+            lines.append(" research: {} | runs {} vetoes {} boosts {} | awaiting {} first look(s)".format(
+                "ON" if self.obscura.available else "UNAVAILABLE",
+                self.research_runs, self.research_vetoes, self.research_boosts,
+                len(self.pending)))
         if self.recent_events:
             lines.append(" last events:")
             lines += ["   " + e for e in self.recent_events[-5:]]
@@ -3142,6 +3732,13 @@ class Swarm:
             "daily_loss_used_usd": round(self.risk.daily_loss_used(), 6),
             "halted": self.risk.halted,
             "awaiting_confirmation": len(self.pending),
+            "research": {"available": self.obscura.available,
+                         "binary": self.obscura.bin,
+                         "runs": self.research_runs,
+                         "vetoes": self.research_vetoes,
+                         "boosts": self.research_boosts,
+                         **{k: self.obscura.stats[k] for k in ("ok", "errors", "blocked",
+                                                               "cache_hits", "timeouts")}},
             "http": {"requests": st.requests, "errors_net": st.errors_net,
                      "errors_4xx": st.errors_4xx, "errors_5xx": st.errors_5xx,
                      "retries": st.retries},
@@ -3395,6 +3992,8 @@ class Swarm:
             self.tasks.append(asyncio.create_task(self.risk_worker(), name="risk"))
         self.tasks.append(asyncio.create_task(self.confirmation_loop(), name="confirm"))
         self.tasks.append(asyncio.create_task(self.heartbeat_loop(), name="heartbeat"))
+        if self.obscura.available:
+            self.tasks.append(asyncio.create_task(self.news_watch_loop(), name="news-watch"))
         self.tasks.append(asyncio.create_task(self.dashboard_loop(), name="dashboard"))
         self.tasks.append(asyncio.create_task(self.tg.sender_loop(self.stop_event), name="telegram"))
 
@@ -3454,6 +4053,22 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[Config, argparse
     p.add_argument("--ledger", default=None, help="CSV path")
     p.add_argument("--log-file", default=None, help="log path")
     p.add_argument("--cg-key", default="", help="optional CoinGecko API key for /coins/list/new")
+    p.add_argument("--research", dest="research", action="store_true", default=None,
+                   help="force the Obscura web-research gate on (default: on if installed)")
+    p.add_argument("--no-research", dest="research", action="store_false",
+                   help="disable web research entirely (pure price/tape rules)")
+    p.add_argument("--obscura", default="", metavar="PATH",
+                   help="path to the obscura binary (default: $OBSCURA_BIN or PATH)")
+    p.add_argument("--research-required", action="store_true",
+                   help="no research answer = no trade (strict; trades rarely)")
+    p.add_argument("--research-channels", default="", metavar="A,B",
+                   help="comma-separated public Telegram channels (t.me/s/...) to scan")
+    p.add_argument("--research-storage-dir", default="", metavar="DIR",
+                   help="Obscura cookie jar; needed for x.com search")
+    p.add_argument("--research-mint", default="", metavar="MINT",
+                   help="mint address to include in --research-check (adds the DEX page)")
+    p.add_argument("--research-check", default=None, metavar="SYMBOL",
+                   help="run the research skill once for SYMBOL, print what it found, exit")
     p.add_argument("--analyze", nargs="?", const="__auto__", default=None, metavar="CSV",
                    help="read trades.csv, print signal quality stats and exit "
                         "(no arg = the default ledger path)")
@@ -3488,6 +4103,16 @@ def build_config(argv: Optional[Sequence[str]] = None) -> Tuple[Config, argparse
         cfg.log_file = args.log_file
     if args.cg_key:
         cfg.cg_api_key = args.cg_key
+    if args.research is not None:
+        cfg.research_enabled = bool(args.research)
+    if args.obscura:
+        cfg.obscura_bin = args.obscura
+    if args.research_required:
+        cfg.research_required = True
+    if args.research_channels:
+        cfg.research_channels = args.research_channels
+    if args.research_storage_dir:
+        cfg.research_storage_dir = args.research_storage_dir
     if args.state:
         cfg.state_file = args.state
     if args.no_state:
@@ -3966,6 +4591,186 @@ def run_selftest() -> int:
           str(confirmation_verdict(1.0, 1.02, 88.0, cfg)))
     check("momentum threshold is stricter than before", cfg.momentum_threshold >= 70)
 
+    # ---------- 1c. web research skill (Obscura, fake browser) -------------
+    def page(lines: List[str]) -> str:
+        return "\n".join(lines)
+
+    clean_page = page([
+        "Dashboard | $GOODMI price chart",
+        "$GOODMI is trending on Solana today, liquidity locked",
+        "community says $GOODMI listing announcement coming",
+        "new memecoin $GOODMI just launched on pump.fun",
+    ])
+    # Same scam words, but on lines that never mention the token: must not count.
+    unrelated_page = page([
+        "Some other coin was a rug pull and a honeypot last week",
+        "unrelated scam warning for a different project",
+        "weather is nice",
+    ])
+    bad_page = page([
+        "$GOODMI is a honeypot, you cannot sell it",
+        "warning: $GOODMI looks like a rug pull",
+        "$GOODMI contract exploit reported",
+    ])
+
+    m_clean = research_mentions(clean_page, "GOODMI")
+    check("research counts token mentions", m_clean.mentions >= 4, str(m_clean.mentions))
+    check("research counts hype words on token lines", m_clean.hype_hits >= 2,
+          str(m_clean.hype_hits))
+    m_unrel = research_mentions(unrelated_page, "GOODMI")
+    check("research ignores scam words on unrelated lines",
+          m_unrel.mentions == 0 and m_unrel.scam_hits == 0, str(m_unrel))
+    m_bad = research_mentions(bad_page, "GOODMI")
+    check("research counts scam words next to the ticker", m_bad.scam_hits >= 3,
+          str(m_bad.scam_hits))
+    m_mint = research_mentions("see " + GOOD + " on solscan", "ZZZ", GOOD)
+    check("research matches the mint address", m_mint.mentions >= 1, str(m_mint))
+
+    per_boost = {"a": dict(m_clean.as_dict(), ok=True), "b": dict(m_clean.as_dict(), ok=True)}
+    r_boost = research_verdict(per_boost, cfg)
+    check("clean chatter boosts the score",
+          r_boost.verdict == "boost" and r_boost.delta > 0, r_boost.line())
+    per_veto = {"a": dict(m_bad.as_dict(), ok=True), "b": dict(m_bad.as_dict(), ok=True)}
+    r_veto = research_verdict(per_veto, cfg)
+    check("bad news on two sources vetoes", r_veto.verdict == "veto", r_veto.line())
+    m_mild = research_mentions("$GOODMI had a rug scare last year, recovered since", "GOODMI")
+    r_one = research_verdict({"a": dict(m_mild.as_dict(), ok=True)}, cfg)
+    check("a single mild bad mention is not enough to veto",
+          r_one.verdict != "veto", r_one.line())
+    r_loud = research_verdict({"a": dict(m_bad.as_dict(), ok=True)}, cfg)
+    check("one page screaming honeypot does veto", r_loud.verdict == "veto", r_loud.line())
+    r_none = research_verdict({"a": {"ok": False, "error": "boom"}}, cfg)
+    check("no answer is reported as unavailable, not neutral",
+          r_none.verdict == "unavailable", r_none.line())
+    r_blocked = research_verdict({"a": {"ok": False, "blocked": True}}, cfg)
+    check("blocked pages are counted", r_blocked.blocked == 1, r_blocked.line())
+
+    base_src = research_sources(cfg, "GOODMI", GOOD)
+    check("research sources are capped", len(base_src) <= cfg.research_max_sources,
+          str([x["name"] for x in base_src]))
+    cfg_x = replace(cfg, research_storage_dir="/tmp/cookies", research_max_sources=9)
+    names_x = [x["name"] for x in research_sources(cfg_x, "GOODMI", GOOD)]
+    check("x.com search only appears when cookies are configured",
+          "x_search" in names_x and "x_search" not in
+          [x["name"] for x in research_sources(replace(cfg_x, research_storage_dir=""),
+                                               "GOODMI", GOOD)], str(names_x))
+    names_tg = [x["name"] for x in research_sources(
+        replace(cfg_x, research_channels="pumpfun, solana"), "GOODMI", GOOD)]
+    check("telegram channels become sources",
+          any(n.startswith("telegram:pumpfun") for n in names_tg), str(names_tg))
+
+    # a fake browser: proves the wrapper's cache, error and blocked handling
+    launch_log: List[List[str]] = []
+
+    def fake_runner(args: List[str], timeout: float) -> Tuple[int, str, str]:
+        launch_log.append(args)
+        url = next((a for a in args if a.startswith("http")), "")
+        if "duckduckgo" in url:
+            return 0, clean_page, ""
+        if "bing" in url:
+            return 0, bad_page, ""
+        if "reddit" in url:
+            return 1, "", "boom"
+        if "x.com" in url:
+            return 0, "Sign in to X. Enable JavaScript to continue.", ""
+        return 0, "", ""
+
+    ob_cfg = replace(cfg, obscura_bin="", research_min_interval_s=0.0,
+                     research_max_sources=3)
+    os.environ["OBSCURA_BIN"] = "/bin/echo"      # exists, is executable, harmless
+    ob = Obscura(ob_cfg, runner=fake_runner)
+    check("obscura binary is discovered from the environment", ob.bin == "/bin/echo",
+          ob.bin)
+    got_ok = asyncio.run(ob.fetch("https://duckduckgo.com/x"))
+    check("fetch returns page text", got_ok.ok and "GOODMI" in got_ok.text, got_ok.error)
+    again = asyncio.run(ob.fetch("https://duckduckgo.com/x"))
+    check("repeat fetch is served from cache",
+          again.from_cache and len(launch_log) == 1, str(len(launch_log)))
+    got_fail = asyncio.run(ob.fetch("https://reddit.com/x"))
+    check("a dead source fails without raising", (not got_fail.ok) and got_fail.error == "boom",
+          got_fail.error)
+    got_wall = asyncio.run(ob.fetch("https://x.com/search"))
+    check("login walls are detected, not parsed", got_wall.blocked and not got_wall.ok,
+          got_wall.error)
+    check("obscura command carries the documented flags",
+          all(flag in ob.command("https://x.com") for flag in
+              ("fetch", "--dump", "markdown", "--stealth", "--timeout")),
+          str(ob.command("https://x.com")))
+    os.environ.pop("OBSCURA_BIN", None)
+    check("without a binary research reports unavailable",
+          (not Obscura(replace(cfg, obscura_bin="")).available)
+          and asyncio.run(Obscura(replace(cfg, obscura_bin="")).fetch("https://x.com")).ok is False,
+          "should be unavailable")
+
+    # swarm-level: veto blocks a real (fake-market) confirmation, boost scores it up
+    async def research_gate_tests() -> None:
+        rcfg = replace(cfg, research_enabled=True, research_min_interval_s=0.0,
+                       ledger_csv=os.path.join(tmpdir, "research_trades.csv"),
+                       log_file=os.path.join(tmpdir, "research_bot.log"),
+                       state_file=os.path.join(tmpdir, "research_state.json"),
+                       state_enabled=False, momentum_threshold=0.0,
+                       research_max_sources=2)
+        client = HttpClient(rcfg, transport=transport)
+        src = Sources(rcfg, client)
+        lg = Ledger(rcfg.ledger_csv, "PAPER")
+        pf = Portfolio(rcfg)
+        sw = Swarm(rcfg, client, src, lg, Telegram(client),
+                   PaperExecutor(rcfg, pf, src), portfolio=pf)
+        sw.obscura = Obscura(rcfg, runner=fake_runner)
+
+        # The token's own DEX page repeats the ticker; that must not read as hype.
+        own_sw = Swarm(replace(rcfg, research_max_sources=1, research_min_interval_s=0.0,
+                               obscura_bin="/bin/echo", state_enabled=False,
+                               ledger_csv=os.path.join(tmpdir, "own_trades.csv")),
+                       HttpClient(rcfg, transport=transport), src, lg, Telegram(client),
+                       PaperExecutor(rcfg, pf, src), portfolio=pf)
+
+        def own_runner(args: List[str], timeout: float) -> Tuple[int, str, str]:
+            if any("dexscreener" in a for a in args):
+                return 0, clean_page, ""
+            return 1, "", "no"
+
+        own_sw.obscura = Obscura(own_sw.cfg, runner=own_runner)
+        own = await own_sw.research(GOOD, "GOODMI")
+        check("the token's own DEX page is not counted as chatter",
+              own.verdict == "neutral" and own.sources_ok == 1, own.line())
+
+        async def fake_research(mint: str, symbol: str, name: str = "") -> ResearchResult:
+            return ResearchResult(verdict="veto", summary="bad news on 2/2 pages",
+                                  sources_ok=2, scam_hits=5, mentions=5)
+
+        entry = {"due": 0.0, "first_seen": time.time() - 2, "price": 0.001, "score": 83.0,
+                 "components": {}, "agent": "momentum0",
+                 "item": {"mint": GOOD, "symbol": "GOODMI", "source": "test"}}
+        sw.research = fake_research          # type: ignore[assignment]
+        await sw._confirm_candidate(GOOD, entry)
+        vetoed = not sw.signals.qsize()
+        rows = open(rcfg.ledger_csv, encoding="utf-8").read() if os.path.exists(rcfg.ledger_csv) else ""
+        check("research veto stops a would-be signal",
+              vetoed and "research_veto" in rows, rows[-200:])
+
+        async def fake_boost(mint: str, symbol: str, name: str = "") -> ResearchResult:
+            return ResearchResult(verdict="boost", delta=100.0, summary="lots of clean chatter",
+                                  sources_ok=2, mentions=9)
+
+        sw.research = fake_boost             # type: ignore[assignment]
+        await sw._confirm_candidate(GOOD, entry)
+        sig = sw.signals.get_nowait() if sw.signals.qsize() else {}
+        check("research boost is applied and clamped to 100",
+              sig.get("score") == 100.0 and bool(sig.get("research")), str(sig.get("score")))
+        check("research availability reaches the heartbeat",
+              (sw._write_heartbeat() or True) and "research" in
+              json.load(open(sw.cfg.heartbeat_file, encoding="utf-8")))
+
+    asyncio.run(research_gate_tests())
+
+    parsed, _args = build_config(["--no-research", "--obscura", "/tmp/x"])
+    check("--no-research and --obscura reach the config",
+          parsed.research_enabled is False and parsed.obscura_bin == "/tmp/x")
+    parsed2, _args2 = build_config(["--research-required", "--research-channels", "a,b"])
+    check("--research-required and --research-channels reach the config",
+          parsed2.research_required and parsed2.research_channels == "a,b")
+
     # ---------- 2. momentum ------------------------------------------------
     strong = momentum_score(_mk_snap(GOOD), MicroStats(
         trades_seen=60, buys_5m=30, sells_5m=6, buy_vol_5m=3000, sell_vol_5m=200,
@@ -4177,6 +4982,8 @@ def run_selftest() -> int:
         row("REJECT", reason="second look: confirm_safety: liquidity; top10")
         row("REJECT", reason="liquidity; top10")
         row("REJECT", reason="confirm_price_dropped -6.1%")
+        row("RESEARCH", reason="VETO | bad news on 2/2 pages")      # early look: bad
+        row("RESEARCH", reason="BOOST | 9 mentions, 0 scam | chatter")  # later: positive
         row("AWAIT_CONFIRM", reason="momentum 86.0")
         row("SIGNAL", reason="confirmed after 25s", score=86.0)
         row("SIGNAL", reason="confirmed after 26s", score=74.0)
@@ -4200,6 +5007,11 @@ def run_selftest() -> int:
           "realized={} win_rate={}".format(ana.get("realized"), ana.get("win_rate")))
     check("analyzer refuses to call 2 trades a strategy",
           ana.get("verdict", "").startswith("NOT ENOUGH DATA"), ana.get("verdict", ""))
+    check("analyzer counts research verdicts",
+          ana.get("research", {}).get("boost") == 1
+          and ana.get("research", {}).get("veto") == 1, str(ana.get("research")))
+    check("analyzer uses the latest news verdict before each buy",
+          ana.get("news_by_pos", {}).get("p1") == "boost", str(ana.get("news_by_pos")))
     check("analyzer report is printable", "SIGNAL QUALITY REPORT" in ana_text)
     missing_text, missing = analyze_ledger(os.path.join(tmpdir, "nope.csv"))
     check("analyzer handles a missing ledger", missing.get("ok") is False
@@ -4369,6 +5181,9 @@ def analyze_ledger(path: str, capital_usd: float = 0.0) -> Tuple[str, Dict[str, 
     symbol_by_pos: Dict[str, str] = {}
     buy_pos: List[str] = []
     partial: Dict[str, float] = {}
+    research_verdicts: Dict[str, int] = {}
+    research_by_mint: Dict[str, str] = {}
+    news_by_pos: Dict[str, str] = {}
     signal_count = buy_count = await_count = 0
 
     for r in rows:
@@ -4381,7 +5196,12 @@ def analyze_ledger(path: str, capital_usd: float = 0.0) -> Tuple[str, Dict[str, 
         if ev in ("REJECT", "VETO", "BUY_FAIL", "SELL_FAIL"):
             for label in _reject_labels(reason):
                 rejects[label] = rejects.get(label, 0) + 1
-        if ev == "SIGNAL":
+        if ev == "RESEARCH":
+            head = (reason or "").split("|")[0].strip().lower() or "unknown"
+            research_verdicts[head] = research_verdicts.get(head, 0) + 1
+            if (r.get("mint") or "").strip():
+                research_by_mint[(r.get("mint") or "").strip()] = head
+        elif ev == "SIGNAL":
             signal_count += 1
         elif ev == "AWAIT_CONFIRM":
             await_count += 1
@@ -4391,6 +5211,8 @@ def analyze_ledger(path: str, capital_usd: float = 0.0) -> Tuple[str, Dict[str, 
             if pos_id:
                 buy_pos.append(pos_id)
                 score_by_pos[pos_id] = fnum_row(r.get("score"))
+                news_by_pos[pos_id] = research_by_mint.get(
+                    (r.get("mint") or "").strip(), "no-research")
                 symbol_by_pos[pos_id] = (r.get("symbol") or "").strip()
         elif ev in ("SELL", "EMERGENCY"):
             fees_usd += fnum_row(r.get("fee_usd"))
@@ -4466,6 +5288,22 @@ def analyze_ledger(path: str, capital_usd: float = 0.0) -> Tuple[str, Dict[str, 
     else:
         lines.append("   nothing yet - no rejections logged")
     lines.append("")
+    if research_verdicts:
+        lines.append(" NEWS GATE (Obscura web research)")
+        lines.append("   verdicts seen          : " + ", ".join(
+            "{} {}".format(k, v) for k, v in
+            sorted(research_verdicts.items(), key=lambda kv: -kv[1])))
+        by_news: Dict[str, List[float]] = {}
+        for pos_id in closed:
+            by_news.setdefault(news_by_pos.get(pos_id, "no-research"), []).append(
+                trade_pnl[pos_id])
+        for tag in sorted(by_news, key=lambda t: -len(by_news[t])):
+            vals = by_news[tag]
+            lines.append("   pnl at {:<13} : {:>3} trades  {:>+8.2f} USD".format(
+                tag, len(vals), sum(vals)))
+        lines.append("   (news verdict recorded before each buy; 'no-research' means the")
+        lines.append("    browser was off, not that there was no news)")
+        lines.append("")
     lines.append(" DOES A HIGHER SCORE MAKE MORE MONEY?")
     if buckets:
         for label in ("70-79", "80-89", "90-100", "unknown"):
@@ -4512,9 +5350,96 @@ def analyze_ledger(path: str, capital_usd: float = 0.0) -> Tuple[str, Dict[str, 
         "wins": len(wins), "losses": len(losses), "win_rate": win_rate,
         "realized": realized, "fees": fees_usd, "profit_factor": profit_factor,
         "rejects": rejects, "buckets": {k: (len(v), sum(v)) for k, v in buckets.items()},
+        "research": research_verdicts, "news_by_pos": news_by_pos,
         "verdict": verdict,
     }
     return "\n".join(lines), stats
+
+
+
+# =============================================================================
+# SECTION 16c.  RESEARCH CHECK  (--research-check SYMBOL)
+#
+# Proves the browser skill works before it is allowed to influence a trade.
+# Prints every source, its status, what it said about the token, and the final
+# verdict. No wallet, no orders, no state file changes.
+# =============================================================================
+
+def research_check(cfg: Config, symbol: str, mint: str = "") -> int:
+    client = Obscura(cfg)
+    print("=" * 78)
+    print(" RESEARCH CHECK  token={}  mint={}".format(symbol, mint or "(not given)"))
+    print("=" * 78)
+    print(" binary   : {}".format(client.bin or "NOT FOUND"))
+    print(" lookup   : {}".format("$%s solana" % symbol))
+    print(" sources  : {}".format(", ".join(src["name"] for src in
+                                            research_sources(cfg, symbol, mint))))
+    print(" stealth  : {}   cookies: {}   obey_robots: {}".format(
+        cfg.research_stealth, client.storage_dir() or "no", cfg.research_obey_robots))
+    if not cfg.research_enabled:
+        print(" NOTE     : research is off in this config (--no-research); the bot will")
+        print("            not use research. This check runs anyway because you asked.")
+    if not client.bin:
+        print("")
+        print(" OBSCURA IS NOT INSTALLED. Nothing was fetched.")
+        print(" Linux/macOS/PC:  https://github.com/h4ckf0r0day/obscura/releases/latest")
+        print(" Termux/Android:  official builds need glibc 2.35+, so run it inside")
+        print("                  proot-distro (see README section 1b) and set")
+        print("                  OBSCURA_BIN=/path/to/your/wrapper")
+        print(" The bot still runs without it: research becomes 'unavailable' and")
+        print(" never blocks or boosts a signal.")
+        return 2
+
+    async def run() -> Tuple[Dict[str, Dict[str, Any]], ResearchResult]:
+        sources = research_sources(cfg, symbol, mint)
+        pages = await client.fetch_many(sources)
+        per: Dict[str, Dict[str, Any]] = {}
+        for src in sources:
+            got = pages.get(src["name"]) or FetchResult(error="no result")
+            status = ("blocked" if got.blocked else
+                      ("ok" if got.ok else "failed"))
+            print("  {:<16} {:<8} {:>6.0f}ms  {}".format(
+                src["name"], status, got.ms, (got.error or "")[:60]))
+            if got.ok:
+                m = research_mentions(got.text, symbol, mint).as_dict()
+                if src.get("own"):
+                    m["mentions"] = 0            # own page: warnings only
+                    m["hype_hits"] = 0
+                    m["samples"] = []
+                print("  {:<16} {} mentions, {} scam words, {} hype words{}".format(
+                    "", m["mentions"], m["scam_hits"], m["hype_hits"],
+                    "  (own page: chatter not counted)" if src.get("own") else ""))
+                for sample in (m["scam_samples"] or m["samples"])[:2]:
+                    print("      > {}".format(sample[:140]))
+                per[src["name"]] = dict(m, ok=True)
+            else:
+                per[src["name"]] = {"ok": False, "blocked": got.blocked,
+                                    "error": got.error}
+        return per, research_verdict(per, cfg)
+
+    per, result = asyncio.run(run())
+    print("-" * 78)
+    print(" VERDICT  : {}".format(result.line()))
+    if result.verdict == "veto":
+        print("            A live buy of this token would now be REJECTED.")
+    elif result.verdict == "boost":
+        print("            A live buy would get {:+.1f} momentum points (max).".format(
+            result.delta))
+    elif result.verdict == "neutral":
+        print("            Nothing conclusive. The trade decision is unchanged.")
+    else:
+        print("            No usable answer. With --research-required this blocks")
+        print("            every trade; without it, price rules decide alone.")
+    if result.notes:
+        print("")
+        print(" WHY:")
+        for note in result.notes[:4]:
+            print("   - {}".format(note[:150]))
+    print("")
+    print(" Reminder: this is keyword matching on public pages, not truth. It can")
+    print(" miss a real rug and it can flag a joke about a rug.")
+    print("=" * 78)
+    return 0
 
 
 # =============================================================================
@@ -4525,6 +5450,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cfg, args = build_config(argv)
     if args.selftest:
         return run_selftest()
+    if args.research_check is not None:
+        return research_check(cfg, args.research_check.strip(), args.research_mint.strip())
     if args.analyze is not None:
         path = cfg.ledger_csv if args.analyze == "__auto__" else args.analyze
         text, _stats = analyze_ledger(path, cfg.start_capital_usd)
