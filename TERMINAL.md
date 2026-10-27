@@ -190,15 +190,23 @@ horizon 6). It is a deliberately unflattering example, because that is what the
 pipeline usually says when costs are realistic:
 
 ```
- usable 1333   split 793 / 261 / 267   threshold 0.29281 (chosen on validation)
- model: net return -0.080%   trades 3   win 0.0%   max DD -0.08%   expectancy -0.02657
- base : net return -0.427%   trades 14  win 21.4%  max DD -0.43%   expectancy -0.03051
- precision 0.0%   false positive rate 2.7%
- sample sufficient: NO  (3 < 30 test trades)
- warning: only 3 test trades - below the 30 needed for a meaningful claim
+ ETHUSDT 1h   1333 usable bars   costs 10.0 bps fee + 10.0 bps slippage
+ split: train 793 / validation 261 / test 267 (chronological, embargo 6)
+
+ metric                            model     baseline
+ net return %                     -0.305       -0.613
+ trades                            9.000       21.000
+ win rate %                       22.220       19.050
+ max drawdown %                   -0.305       -0.647
+ expectancy / trade               -0.034       -0.029
+ precision                         0.108            —
+ false positive rate               0.153            —
+
+ sample sufficient: NO (9 < 30 test trades)
+ beats baseline   : no
 ```
 
-Read that as: the model avoided most of the baseline's damage, but with three
+Read that as: the model lost less than the momentum baseline, but with nine
 trades the difference is noise, and the report says so instead of selling you a
 strategy.
 
@@ -271,7 +279,7 @@ memeterm/
   config.py             validated limits with hard ceilings
   secrets_store.py      0600 credential file, masking, deletion
   store.py              state.json, trades.csv ledger, audit.jsonl
-  paper.py -> execution.py  paper + live brokers and the single order manager
+  execution.py          paper + live brokers and the single order manager
   risk.py               server-side order checks with reason codes
   agents.py             100 agents, 10 teams, ensemble + vetoes
   market.py             cached market data (tickers, klines, depth, trades)
