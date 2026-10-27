@@ -33,9 +33,8 @@ Copy-paste, in order. Nothing here needs root, an API key or a wallet.
 pkg update && pkg upgrade -y
 pkg install -y python git
 
-# 2) clone the branch that holds the bot
-git clone -b arena/efd16a2f-my-otp-phish \
-  https://github.com/hillarytizian-boop/my-otp-phish.git
+# 2) clone the repo
+git clone https://github.com/hillarytizian-boop/my-otp-phish.git
 cd my-otp-phish
 
 # 3) prove it works offline: no network, no keys, no money (~50 s)
@@ -48,9 +47,7 @@ python meme_agents.py --scan
 python meme_agents.py
 ```
 
-`-b arena/efd16a2f-my-otp-phish` matters: `main` still holds the previous
-project, the bot lives on that branch. After cloning, the branch is tracked, so
-plain `git pull` is enough to update.
+`main` holds the bot, so a plain `git clone` / `git pull` is all you need.
 
 **Stop it:** `Ctrl+C` (or, from a second Termux session, `touch STOP` in the same
 folder). It closes open positions, prints a summary and exits — and because it
@@ -72,18 +69,18 @@ termux-wake-lock
 while true; do python meme_agents.py --paper; sleep 10; done
 ```
 
-**No git?** Download the branch as a tarball instead:
+**No git?** Download the repo as a tarball instead:
 
 ```bash
 cd ~
-curl -L -o bot.tar.gz "https://codeload.github.com/hillarytizian-boop/my-otp-phish/tar.gz/refs/heads/arena/efd16a2f-my-otp-phish"
+curl -L -o bot.tar.gz "https://codeload.github.com/hillarytizian-boop/my-otp-phish/tar.gz/refs/heads/main"
 tar xzf bot.tar.gz
-mv my-otp-phish-arena-efd16a2f-my-otp-phish my-otp-phish
+mv my-otp-phish-main my-otp-phish
 cd my-otp-phish
 python meme_agents.py --selftest && python meme_agents.py
 ```
 
-Either way you end up with `meme_agents.py` + `README.md` in one folder. The bot
+Either way you end up with `meme_agents.py` + `fomo_provider.py` + `README.md` in one folder. The bot
 creates `trades.csv`, `bot.log`, `state.json` and `heartbeat.json` next to itself.
 
 **Where did the files go?** Everything is created in the folder you started the bot
