@@ -20,11 +20,81 @@ scams, scores momentum, and trades in tiny fixed size with hard risk limits.
 
 ---
 
+## Quick start on Termux (clone + run)
+
+Copy-paste, in order. Nothing here needs root, an API key or a wallet.
+
+```bash
+# 1) one-time packages (git is only needed to clone)
+pkg update && pkg upgrade -y
+pkg install -y python git
+
+# 2) clone the branch that holds the bot
+git clone -b arena/efd16a2f-my-otp-phish \
+  https://github.com/hillarytizian-boop/my-otp-phish.git
+cd my-otp-phish
+
+# 3) prove it works offline: no network, no keys, no money (~50 s)
+python meme_agents.py --selftest
+
+# 4) run it: PAPER mode, simulated fills, no real money
+python meme_agents.py
+```
+
+`-b arena/efd16a2f-my-otp-phish` matters: `main` still holds the previous
+project, the bot lives on that branch. After cloning, the branch is tracked, so
+plain `git pull` is enough to update.
+
+**Stop it:** `Ctrl+C` (or, from a second Termux session, `touch STOP` in the same
+folder). It closes open positions, prints a summary and exits — and because it
+saves `state.json`, the next start resumes with the same portfolio.
+
+**Update later:**
+
+```bash
+cd ~/my-otp-phish
+git pull
+python meme_agents.py --selftest     # 101 checks, must pass before you run it
+python meme_agents.py
+```
+
+**Keep it alive after the screen locks (24/7):**
+
+```bash
+termux-wake-lock
+while true; do python meme_agents.py --paper; sleep 10; done
+```
+
+**No git?** Download the branch as a tarball instead:
+
+```bash
+cd ~
+curl -L -o bot.tar.gz "https://codeload.github.com/hillarytizian-boop/my-otp-phish/tar.gz/refs/heads/arena/efd16a2f-my-otp-phish"
+tar xzf bot.tar.gz
+mv my-otp-phish-arena-efd16a2f-my-otp-phish my-otp-phish
+cd my-otp-phish
+python meme_agents.py --selftest && python meme_agents.py
+```
+
+Either way you end up with `meme_agents.py` + `README.md` in one folder. The bot
+creates `trades.csv`, `bot.log`, `state.json` and `heartbeat.json` next to itself.
+
+**Where did the files go?** Everything is created in the folder you started the bot
+from — with the commands above, `/data/data/com.termux/files/home/my-otp-phish`
+(Termux's "home", shown as `~/my-otp-phish`). Run `termux-setup-storage` once and grant
+the prompt if you want to copy `trades.csv`, `bot.log` or `final_report.txt` out to your
+phone's shared storage (`~/storage/shared/...`) for viewing in a file manager.
+
+Next: §1 for the full install (including optional live-mode signing), §2 for run modes
+and dashboards, §1b if you want the optional browser-based news check.
+
+---
+
 ## 1. Install (Termux, no root)
 
 ```bash
 pkg update && pkg upgrade -y
-pkg install -y python
+pkg install -y python git        # git only for cloning/updating (see quick start)
 
 # PAPER MODE: nothing else. The script is 100% standard library.
 
@@ -91,6 +161,7 @@ never in the discovery loop.
 ### Paper mode (default, simulated fills, no real money)
 
 ```bash
+cd ~/my-otp-phish        # the folder you cloned in the quick start
 python meme_agents.py
 ```
 
