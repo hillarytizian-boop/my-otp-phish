@@ -73,6 +73,14 @@ class DemoTransport:
                          "{:.4f}".format(volume * 0.55), "{:.4f}".format(volume * 0.55 * close),
                          "0"])
             level = close
+        # Anchor the series to the live ticker price so the chart, the ticker and
+        # the kline agents all agree (real feeds agree to within a tick).
+        if rows:
+            last_close = float(rows[-1][4])
+            factor = price / last_close if last_close else 1.0
+            for row in rows:
+                for index in (1, 2, 3, 4, 7):
+                    row[index] = "{:.8f}".format(float(row[index]) * factor)
         return rows
 
     # ------------------------------------------------------------------
