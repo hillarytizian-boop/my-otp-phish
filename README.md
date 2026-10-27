@@ -11,6 +11,12 @@ It also has a **signal-only mode** that never places an order: `--scan` prints r
 cards once, `--watch` keeps printing them and can push the confirmed ones to Telegram.
 See [§2b](#2b-signals-only-scan-and-watch-never-trades).
 
+**New in v2.0: a local Binance Spot AI trading terminal.** `python meme_terminal.py serve`
+opens a paper-first dashboard at <http://127.0.0.1:8787> with 100 research agents, a
+cost-aware backtester and a guarded live-Spot path. It is a separate module and does not
+change anything the Solana bot does. Read [TERMINAL.md](TERMINAL.md) first - it includes
+the security model, the API-key checklist and an honest list of limits.
+
 > **On "sure signals".** There is no such thing as a sure signal in memecoins, and no
 > amount of agent count changes that. What this version does instead is make entries
 > *harder* (stricter score, real tape required, every filter re-checked on a second look),

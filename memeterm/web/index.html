@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0a0c10">
+<title>Meme Agents Terminal</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<div id="login" class="login hidden" role="dialog" aria-modal="true" aria-labelledby="login-title">
+  <form id="login-form" class="login-card">
+    <h1 id="login-title">Terminal access</h1>
+    <p class="muted">This dashboard is reachable beyond this device, so it needs the
+      access code printed in the server console. The code is never stored in the page.</p>
+    <label for="access-code">Access code</label>
+    <input id="access-code" name="access_code" type="password" autocomplete="off"
+           spellcheck="false" required>
+    <button class="btn primary" type="submit">Unlock</button>
+    <p id="login-error" class="error" role="alert"></p>
+  </form>
+</div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="dot" id="conn-dot" aria-hidden="true"></span>
+    <span class="brand-name">MEME AGENTS</span>
+    <span class="brand-sub">terminal</span>
+  </div>
+  <div class="mode" id="mode-badge">PAPER</div>
+  <div class="equity">
+    <span class="label">Equity</span>
+    <strong id="equity">—</strong>
+  </div>
+  <div class="equity small">
+    <span class="label">Day P&amp;L</span>
+    <strong id="day-pnl">—</strong>
+  </div>
+  <button id="stop-btn" class="btn danger" type="button" title="Emergency stop">
+    STOP
+  </button>
+</header>
+
+<div id="live-banner" class="live-banner hidden" role="status">
+  LIVE SPOT TRADING — real orders are being sent to Binance with your key.
+</div>
+<div id="paper-banner" class="paper-banner">PAPER MODE — simulated fills, no real money moves.</div>
+<div id="demo-banner" class="demo-banner hidden">DEMO DATA — synthetic prices, no exchange connection.</div>
+
+<nav class="tabs" aria-label="Sections">
+  <button class="tab active" data-page="dashboard" type="button">Dashboard</button>
+  <button class="tab" data-page="trade" type="button">Trade</button>
+  <button class="tab" data-page="agents" type="button">Agents</button>
+  <button class="tab" data-page="backtest" type="button">Research</button>
+  <button class="tab" data-page="settings" type="button">Settings</button>
+</nav>
+
+<main id="main">
+
+  <!-- ===================== DASHBOARD ===================== -->
+  <section class="page active" id="page-dashboard" aria-labelledby="h-dashboard">
+    <h2 id="h-dashboard" class="sr-only">Dashboard</h2>
+
+    <div class="grid stats">
+      <div class="card stat">
+        <span class="label">Available <span id="quote-asset">USDT</span></span>
+        <strong id="available">—</strong>
+        <span class="hint" id="available-hint"></span>
+      </div>
+      <div class="card stat">
+        <span class="label">Unrealized</span>
+        <strong id="unrealized">—</strong>
+        <span class="hint" id="exposure-hint"></span>
+      </div>
+      <div class="card stat">
+        <span class="label">Realized</span>
+        <strong id="realized">—</strong>
+        <span class="hint" id="winrate-hint"></span>
+      </div>
+      <div class="card stat">
+        <span class="label">Daily risk used</span>
+        <strong id="risk-used">—</strong>
+        <div class="meter"><span id="risk-bar"></span></div>
+      </div>
+    </div>
+
+    <div class="grid main">
+      <div class="card chart-card">
+        <div class="card-head">
+          <h3 id="chart-title">Chart</h3>
+          <div class="seg" id="interval-seg" role="group" aria-label="Timeframe">
+            <button data-interval="1m" type="button">1m</button>
+            <button data-interval="5m" class="on" type="button">5m</button>
+            <button data-interval="15m" type="button">15m</button>
+            <button data-interval="1h" type="button">1h</button>
+          </div>
+        </div>
+        <canvas id="chart" height="300" role="img"
+                aria-label="Candlestick chart with volume"></canvas>
+        <div class="chart-meta" id="chart-meta">—</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h3>Watchlist</h3>
+          <span class="hint" id="watch-age">—</span>
+        </div>
+        <table class="table" id="watchlist">
+          <thead><tr><th>Symbol</th><th class="num">Price</th><th class="num">24h</th>
+            <th class="num">Spread</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="grid two">
+      <div class="card">
+        <div class="card-head"><h3>Open positions</h3>
+          <span class="hint" id="positions-count">0 / 3</span></div>
+        <table class="table" id="positions">
+          <thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Entry</th>
+            <th class="num">Mark</th><th class="num">P&amp;L</th><th></th></tr></thead>
+          <tbody><tr><td colspan="6" class="empty">No open positions.</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>Agent consensus</h3>
+          <span class="hint" id="consensus-age">not run yet</span></div>
+        <div class="consensus">
+          <div class="verdict" id="consensus-verdict">WAIT</div>
+          <div class="score-wrap">
+            <div class="score" id="consensus-score">—</div>
+            <div class="score-bar"><span id="consensus-bar"></span></div>
+            <div class="hint" id="consensus-detail">100 agents idle</div>
+          </div>
+        </div>
+        <ul class="inline-list" id="consensus-teams"></ul>
+        <ul class="inline-list vetoes" id="consensus-vetoes"></ul>
+      </div>
+    </div>
+
+    <div class="grid two">
+      <div class="card">
+        <div class="card-head"><h3>Open orders</h3></div>
+        <table class="table" id="open-orders">
+          <thead><tr><th>Symbol</th><th>Side</th><th class="num">Qty</th>
+            <th class="num">Price</th><th>Status</th><th></th></tr></thead>
+          <tbody><tr><td colspan="6" class="empty">None.</td></tr></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Recent fills</h3></div>
+        <table class="table" id="fills">
+          <thead><tr><th>Time</th><th>Symbol</th><th>Side</th>
+            <th class="num">Qty</th><th class="num">Price</th><th class="num">Fee</th></tr></thead>
+          <tbody><tr><td colspan="6" class="empty">No trades yet.</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card health">
+      <div class="card-head"><h3>System health</h3>
+        <span class="hint" id="last-update">—</span></div>
+      <ul class="kv" id="health-list"></ul>
+    </div>
+  </section>
+
+  <!-- ===================== TRADE ===================== -->
+  <section class="page" id="page-trade" aria-labelledby="h-trade">
+    <h2 id="h-trade">Trade</h2>
+    <div class="grid two">
+      <form class="card" id="order-form" autocomplete="off">
+        <div class="card-head"><h3>Order ticket</h3>
+          <span class="pill" id="ticket-mode">PAPER</span></div>
+
+        <label for="symbol-input">Symbol</label>
+        <div class="row">
+          <input id="symbol-input" name="symbol" list="symbol-list" placeholder="BTCUSDT"
+                 spellcheck="false" required>
+          <datalist id="symbol-list"></datalist>
+          <button class="btn ghost" id="symbol-refresh" type="button"
+                  title="Reload Binance Spot symbols">↻</button>
+        </div>
+        <p class="hint" id="symbol-hint">Only listed Binance Spot USDT symbols are accepted.</p>
+
+        <div class="seg wide" id="side-seg" role="group" aria-label="Side">
+          <button type="button" data-side="BUY" class="on buy">Buy</button>
+          <button type="button" data-side="SELL" class="sell">Sell</button>
+        </div>
+
+        <div class="seg wide" id="type-seg" role="group" aria-label="Order type">
+          <button type="button" data-type="MARKET" class="on">Market</button>
+          <button type="button" data-type="LIMIT">Limit</button>
+        </div>
+
+        <label for="quote-amount">Amount (<span id="amount-asset">USDT</span>)</label>
+        <input id="quote-amount" name="quote_amount" type="number" inputmode="decimal"
+               step="0.01" min="0" placeholder="10.00">
+        <div class="chips" id="amount-chips">
+          <button type="button" data-amount="1">1</button>
+          <button type="button" data-amount="2">2</button>
+          <button type="button" data-amount="5">5</button>
+          <button type="button" data-amount="10">10</button>
+        </div>
+
+        <div id="limit-row" class="hidden">
+          <label for="limit-price">Limit price (USDT)</label>
+          <input id="limit-price" type="number" inputmode="decimal" step="0.00000001" min="0">
+        </div>
+
+        <div class="ticket-meta">
+          <div><span class="label">Mark</span><strong id="ticket-mark">—</strong></div>
+          <div><span class="label">Est. fee</span><strong id="ticket-fee">—</strong></div>
+          <div><span class="label">Est. slippage</span><strong id="ticket-slip">—</strong></div>
+          <div><span class="label">Total cost</span><strong id="ticket-total">—</strong></div>
+        </div>
+
+        <button class="btn primary block" id="preview-btn" type="button">Preview order</button>
+        <p class="hint" id="preview-note">Nothing is sent until you confirm the preview.</p>
+      </form>
+
+      <div class="card">
+        <div class="card-head"><h3>Pre-flight checks</h3>
+          <span class="pill" id="risk-pill">—</span></div>
+        <ul class="checks" id="risk-checks">
+          <li class="muted">Preview an order to see every server-side check.</li>
+        </ul>
+        <div class="limits">
+          <div><span class="label">Max order</span><strong id="limit-order">—</strong></div>
+          <div><span class="label">Max exposure</span><strong id="limit-exposure">—</strong></div>
+          <div><span class="label">Daily loss</span><strong id="limit-daily">—</strong></div>
+          <div><span class="label">Max positions</span><strong id="limit-positions">—</strong></div>
+        </div>
+        <p class="hint">Limits are enforced on the server. Changing them here is not
+          possible; use Settings, and they still cannot exceed the hard ceilings.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== AGENTS ===================== -->
+  <section class="page" id="page-agents" aria-labelledby="h-agents">
+    <h2 id="h-agents">Agents</h2>
+    <div class="grid two">
+      <div class="card">
+        <div class="card-head"><h3>Consensus</h3>
+          <button class="btn ghost" id="agents-run" type="button">Run all 100</button></div>
+        <div class="consensus">
+          <div class="verdict" id="agents-verdict">WAIT</div>
+          <div class="score-wrap">
+            <div class="score" id="agents-score">—</div>
+            <div class="score-bar"><span id="agents-bar"></span></div>
+            <div class="hint" id="agents-meta">—</div>
+          </div>
+        </div>
+        <ul class="teams" id="agent-teams"></ul>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Top evidence</h3></div>
+        <ul class="evidence" id="agent-evidence">
+          <li class="muted">Run the agents to see reason codes and evidence.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h3>Registry — 100 agents, 10 teams</h3>
+        <div class="row">
+          <select id="agent-team-filter" aria-label="Filter by team">
+            <option value="">All teams</option>
+          </select>
+          <input id="agent-search" type="search" placeholder="filter role" aria-label="Filter roles">
+        </div>
+      </div>
+      <div class="agent-grid" id="agent-grid"></div>
+    </div>
+  </section>
+
+  <!-- ===================== RESEARCH ===================== -->
+  <section class="page" id="page-backtest" aria-labelledby="h-research">
+    <h2 id="h-research">Research</h2>
+    <form class="card" id="backtest-form">
+      <div class="card-head"><h3>Backtest &amp; model evaluation</h3>
+        <span class="hint">chronological splits, fees and slippage included</span></div>
+      <div class="grid three">
+        <div>
+          <label for="bt-symbol">Symbol</label>
+          <input id="bt-symbol" value="BTCUSDT" spellcheck="false">
+        </div>
+        <div>
+          <label for="bt-interval">Interval</label>
+          <select id="bt-interval">
+            <option value="5m">5m</option>
+            <option value="15m" selected>15m</option>
+            <option value="1h">1h</option>
+            <option value="4h">4h</option>
+          </select>
+        </div>
+        <div>
+          <label for="bt-bars">Bars</label>
+          <input id="bt-bars" type="number" min="300" max="5000" step="100" value="1500">
+        </div>
+      </div>
+      <div class="row">
+        <button class="btn primary" type="submit">Run backtest</button>
+        <label class="check"><input type="checkbox" id="bt-save"> save model version</label>
+        <span class="hint" id="bt-status"></span>
+      </div>
+    </form>
+
+    <div class="card hidden" id="bt-results">
+      <div class="card-head"><h3>Results</h3>
+        <span class="pill" id="bt-sample-pill">—</span></div>
+      <div class="grid stats" id="bt-stats"></div>
+      <table class="table" id="bt-table">
+        <thead><tr><th>Metric</th><th class="num">Model</th><th class="num">Baseline</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="hint" id="bt-honesty"></p>
+    </div>
+  </section>
+
+  <!-- ===================== SETTINGS ===================== -->
+  <section class="page" id="page-settings" aria-labelledby="h-settings">
+    <h2 id="h-settings">Settings</h2>
+
+    <div class="grid two">
+      <div class="card">
+        <div class="card-head"><h3>Exchange connection</h3>
+          <span class="pill" id="conn-pill">disconnected</span></div>
+        <dl class="kv" id="conn-kv"></dl>
+
+        <form id="cred-form" autocomplete="off">
+          <label for="api-key">Binance API key</label>
+          <input id="api-key" type="password" spellcheck="false" autocomplete="off">
+          <label for="api-secret">Binance API secret</label>
+          <input id="api-secret" type="password" spellcheck="false" autocomplete="off">
+          <div class="row">
+            <button class="btn primary" type="submit">Save locally</button>
+            <button class="btn ghost" id="test-conn" type="button">Test connection</button>
+            <button class="btn danger ghost" id="delete-cred" type="button">Delete key</button>
+          </div>
+          <p class="hint">Sent only to this local process over loopback. Stored in a 0600
+            file outside the repository. Never shown again, never logged.</p>
+        </form>
+        <ul class="checks" id="conn-checks"></ul>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h3>Trading mode</h3>
+          <span class="pill" id="mode-pill">PAPER</span></div>
+        <div class="seg wide" id="mode-seg" role="group" aria-label="Trading mode">
+          <button type="button" data-mode="DISCONNECTED">Disconnected</button>
+          <button type="button" data-mode="PAPER" class="on">Paper</button>
+          <button type="button" data-mode="LIVE_SPOT">Live Spot</button>
+        </div>
+        <div id="live-form" class="hidden">
+          <p class="warn">Live trading sends real orders. The pre-flight must pass, and
+            this session only: live mode is never restored on restart.</p>
+          <ul class="checks" id="preflight-checks"></ul>
+          <label for="live-confirm">Type
+            <code id="live-phrase">I ACCEPT THE RISK</code></label>
+          <input id="live-confirm" spellcheck="false" autocomplete="off">
+          <label class="check"><input type="checkbox" id="live-ack">
+            I understand this can lose money and that the key must have withdrawals disabled.</label>
+          <button class="btn danger" id="live-activate" type="button">Activate live Spot</button>
+          <button class="btn ghost" id="live-off" type="button">Back to paper</button>
+        </div>
+        <p class="hint">Paper is the default after every start. Saving API keys never
+          enables live trading.</p>
+      </div>
+    </div>
+
+    <form class="card" id="limits-form">
+      <div class="card-head"><h3>Risk limits</h3>
+        <span class="hint">server-validated, with hard ceilings</span></div>
+      <div class="grid four">
+        <div><label for="max-order">Max order (USDT)</label>
+          <input id="max-order" type="number" min="1" step="0.5"></div>
+        <div><label for="max-exposure">Max exposure (USDT)</label>
+          <input id="max-exposure" type="number" min="1" step="1"></div>
+        <div><label for="daily-loss">Daily loss limit (USDT)</label>
+          <input id="daily-loss" type="number" min="0.1" step="0.1"></div>
+        <div><label for="max-positions">Max positions</label>
+          <input id="max-positions" type="number" min="1" max="20" step="1"></div>
+      </div>
+      <div class="grid four">
+        <div><label for="per-symbol">Per-symbol exposure</label>
+          <input id="per-symbol" type="number" min="1" step="1"></div>
+        <div><label for="slippage">Slippage assumption (bps)</label>
+          <input id="slippage" type="number" min="0" max="200" step="1"></div>
+        <div><label for="refresh">Market refresh (s)</label>
+          <input id="refresh" type="number" min="2" max="60" step="1"></div>
+        <div><label for="watchlist">Watchlist (comma separated)</label>
+          <input id="watchlist" spellcheck="false"></div>
+      </div>
+      <div class="row">
+        <button class="btn primary" type="submit">Save limits</button>
+        <span class="hint" id="limits-status"></span>
+      </div>
+    </form>
+
+    <div class="grid two">
+      <div class="card">
+        <div class="card-head"><h3>Notifications</h3></div>
+        <dl class="kv" id="telegram-kv"></dl>
+        <p class="hint">Telegram is optional and read from the environment:
+          <code>TELEGRAM_BOT_TOKEN</code>, <code>TELEGRAM_CHAT_ID</code>. Restart the
+          terminal after exporting them.</p>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Audit log</h3>
+          <button class="btn ghost" id="audit-export" type="button">Download JSON</button></div>
+        <ul class="events" id="audit-list"><li class="muted">Loading…</li></ul>
+      </div>
+    </div>
+
+    <div class="card security">
+      <h3>Security notes</h3>
+      <ul>
+        <li>The server binds to <code>127.0.0.1</code> by default. Loopback is not an
+          encryption boundary: malware or a compromised phone can read local files.</li>
+        <li>Use a Binance key with <strong>Spot trading only</strong>, withdrawals
+          disabled, and an IP allowlist where supported. This program never calls the
+          withdrawal API and never asks for a seed phrase or private key.</li>
+        <li>State-changing requests require a same-origin CSRF token; the session cookie
+          is HttpOnly and SameSite=Strict.</li>
+        <li>Live mode is per-session and cannot survive a restart or a lost connection.</li>
+      </ul>
+    </div>
+  </section>
+</main>
+
+<nav class="bottom-nav" aria-label="Primary">
+  <button data-page="dashboard" class="active" type="button"><span>◧</span>Dash</button>
+  <button data-page="trade" type="button"><span>⇅</span>Trade</button>
+  <button data-page="agents" type="button"><span>◉</span>Agents</button>
+  <button data-page="backtest" type="button"><span>∿</span>Research</button>
+  <button data-page="settings" type="button"><span>⚙</span>Settings</button>
+</nav>
+
+<div id="modal" class="modal hidden" role="dialog" aria-modal="true"
+     aria-labelledby="modal-title">
+  <div class="modal-card">
+    <h3 id="modal-title">Confirm order</h3>
+    <div id="modal-body"></div>
+    <div class="row end">
+      <button class="btn ghost" id="modal-cancel" type="button">Cancel</button>
+      <button class="btn primary" id="modal-confirm" type="button">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script src="/app.js" defer></script>
+</body>
+</html>

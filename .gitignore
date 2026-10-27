@@ -17,3 +17,10 @@ signals.json
 signals.json.tmp
 __pycache__/
 *.pyc
+
+# terminal runtime data (defaults to ~/.meme_terminal, but keep it out of git
+# if someone points --data-dir at the repo)
+.meme_terminal/
+credentials.json
+audit.jsonl
+models/
