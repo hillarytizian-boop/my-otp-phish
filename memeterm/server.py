@@ -24,6 +24,7 @@ import json
 import mimetypes
 import os
 import posixpath
+import re
 import secrets
 import threading
 import time
@@ -37,7 +38,7 @@ from .binance import BinanceError
 from .config import ConfigError, TerminalConfig
 from .engine import LIVE_CONFIRMATION, EngineError, TradingEngine
 from .risk import MODE_LIVE, MODE_PAPER
-from .util import redact, utc_str
+from .util import parse_day_ms, redact, utc_str
 
 WEB_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 MAX_BODY_BYTES = 64 * 1024
@@ -631,13 +632,38 @@ class TerminalServer:
         interval = str(payload.get("interval") or "15m")
         bars = int(payload.get("bars") or 1500)
         bars = max(200, min(bars, 5000))
-        candles = collect_candles(self.engine.client, symbol, interval, bars)
+        start_raw, end_raw = payload.get("start"), payload.get("end")
+        start_ms = end_ms = None
+        if start_raw or end_raw:
+            if not (start_raw and end_raw):
+                raise ApiError("give both a start and an end date, or neither",
+                               400, "BAD_WINDOW")
+            try:
+                start_ms = parse_day_ms(start_raw)
+                end_ms = parse_day_ms(end_raw)
+            except ValueError as exc:
+                raise ApiError(str(exc), 400, "BAD_DATE")
+            if end_ms <= start_ms:
+                raise ApiError("end must be after start", 400, "BAD_WINDOW")
+            if end_ms - start_ms > 400 * 86_400_000:
+                raise ApiError("range is longer than 400 days; narrow it",
+                               400, "BAD_WINDOW")
+        candles = collect_candles(self.engine.client, symbol, interval, bars,
+                                  start_ms=start_ms, end_ms=end_ms)
         if not candles:
             raise ApiError("no historical candles available for {}".format(symbol),
                            502, "NO_DATA")
+        label = re.sub(r"[^A-Za-z0-9._-]", "", str(payload.get("label") or ""))[:24]
         report = self.engine.backtester.run(candles, symbol=symbol, interval=interval,
                                             horizon=int(payload.get("horizon") or 6),
-                                            persist=bool(payload.get("save")))
+                                            persist=bool(payload.get("save")),
+                                            label=label)
+        report["window"] = {
+            "source": "explicit date range" if start_ms else "most recent bars",
+            "start": utc_str(start_ms / 1000.0) if start_ms else None,
+            "end": utc_str(end_ms / 1000.0) if end_ms else None,
+            "requested_bars": bars,
+        }
         return {"ok": bool(report.get("ok")), "report": report}
 
 

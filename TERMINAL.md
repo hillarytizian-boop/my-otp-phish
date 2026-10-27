@@ -39,7 +39,7 @@ pkg update && pkg upgrade -y
 pkg install -y python
 cd ~/my-otp-phish          # the cloned repository
 python meme_terminal.py --version
-python meme_terminal.py selftest      # 57 offline tests, no network, ~8 s
+python meme_terminal.py selftest      # 62 offline tests, no network, ~8 s
 ```
 
 No pip packages, no compiler, no `solders`. The browser UI is three static files
@@ -165,7 +165,26 @@ requests, no 100 processes on a phone.
 ```bash
 python meme_terminal.py backtest BTCUSDT --interval 15m --bars 1500
 python meme_terminal.py train    ETHUSDT --interval 1h  --bars 3000 --save
+
+# explicit calendar window instead of "the most recent N bars" (max 400 days)
+python meme_terminal.py backtest ETHUSDT --interval 1h \
+    --start 2026-09-01 --end 2026-10-27
+
+# label a saved model version (appended to SYMBOL-INTERVAL-STAMP)
+python meme_terminal.py train ETHUSDT --interval 1h --bars 1400 --save --label trend-v2
 ```
+
+`--start` and `--end` must be given together as `YYYY-MM-DD`; the range wins
+over `--bars` and is trimmed exactly to the window. Bad dates exit with status
+`2` and a one-line reason (`--end must be after --start`, `bad date: ...`,
+`range is longer than 400 days`). The same controls exist in the Research page
+(From / To / Version label), where the API additionally returns
+`window: {source, start, end}` inside the report.
+
+The Research page shows the newest saved model (`/api/backtest/latest`): version,
+training time, holdout trade count, net return and the sample-size verdict. A
+saved model is an artefact for inspection - it is never loaded into order
+decisions and never enables live mode.
 
 What the pipeline does, in order:
 
@@ -288,7 +307,7 @@ memeterm/
   server.py             HTTP API, security headers, CSRF, static UI
   demo.py               synthetic data for offline evaluation (cannot trade)
   web/                  index.html, app.js, styles.css (no build step)
-tests/test_memeterm.py  57 offline tests
+tests/test_memeterm.py  62 offline tests
 ```
 
 ## 12. Warning

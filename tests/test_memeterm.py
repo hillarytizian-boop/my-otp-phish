@@ -30,8 +30,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from memeterm.agents import REGISTRY, TEAMS, AgentRunner, MarketContext          # noqa: E402
-from memeterm.backtest import (build_dataset, chronological_split, features_at,   # noqa: E402
-                               baseline_signals, simulate, train_logistic)
+from memeterm.backtest import (build_dataset, chronological_split, collect_candles,  # noqa: E402
+                               features_at, baseline_signals, simulate, train_logistic)
 from memeterm.binance import (AmbiguousOrderError, AuthError, BinanceClient,     # noqa: E402
                               BinanceError, NetworkError, Response, SymbolFilters)
 from memeterm.config import ConfigError, TerminalConfig                          # noqa: E402
@@ -43,7 +43,7 @@ from memeterm.risk import (MODE_DISCONNECTED, MODE_LIVE, MODE_PAPER,            
 from memeterm.secrets_store import CredentialError, SecretsStore                 # noqa: E402
 from memeterm.server import TerminalServer                                       # noqa: E402
 from memeterm.store import StateStore                                            # noqa: E402
-from memeterm.util import fingerprint, mask_key, redact                          # noqa: E402
+from memeterm.util import (fingerprint, mask_key, parse_day_ms, redact)           # noqa: E402
 
 API_KEY = "K" * 64
 API_SECRET = "S" * 64
@@ -797,6 +797,46 @@ class TestBacktest(BaseCase):
         self.assertEqual(baseline_signals(rows), [False])
 
 
+    def test_date_range_selects_the_requested_window(self):
+        """A start/end request returns that window, not "the newest N bars"."""
+
+        class WindowedClient:
+            def __init__(self):
+                self.calls = []
+
+            def klines(self, symbol, interval="1m", limit=200,
+                       start_ms=None, end_ms=None):
+                self.calls.append({"limit": limit, "end_ms": end_ms})
+                step = 60_000
+                anchor = end_ms if end_ms else 1_700_000_000_000
+                rows = []
+                for i in range(limit):
+                    open_ms = anchor - i * step
+                    rows.append([open_ms, "100", "101", "99", "100.5", "10",
+                                 open_ms + step - 1, "1005", "5", "6", "60.3", "0"])
+                return list(reversed(rows))
+
+        end = 1_700_000_000_000
+        start = end - 100 * 60_000
+        client = WindowedClient()
+        candles = collect_candles(client, "BTCUSDT", "1m", bars=1000,
+                                  start_ms=start, end_ms=end)
+        self.assertTrue(candles)
+        self.assertGreaterEqual(candles[0]["ts"], start)
+        self.assertLessEqual(candles[-1]["ts"], end)
+        self.assertLessEqual(len(candles), 101)
+        self.assertEqual(client.calls[0]["end_ms"], end)     # the range is used
+
+    def test_date_parsing_is_strict(self):
+        self.assertEqual(parse_day_ms("1970-01-02"), 86_400_000)
+        self.assertIsNone(parse_day_ms(""))
+        self.assertIsNone(parse_day_ms(None))
+        with self.assertRaises(ValueError):
+            parse_day_ms("31/01/2026")
+        with self.assertRaises(ValueError):
+            parse_day_ms("tomorrow")
+
+
 # ---------------------------------------------------------------------------
 # 10. HTTP server: security, static UI, API
 # ---------------------------------------------------------------------------
@@ -898,6 +938,26 @@ class TestServer(BaseCase):
             urllib.request.urlopen(request, timeout=10)
         self.assertEqual(caught.exception.code, 421)
 
+    def test_backtest_rejects_bad_date_window(self):
+        server = self.start()
+        headers = self.bootstrap(server)
+        payload = self.fetch(server, "/api/backtest", "POST",
+                             {"symbol": SYMBOL, "interval": "1m",
+                              "start": "2026-02-01", "end": "2026-01-01"}, headers)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["code"], "BAD_WINDOW")
+        one_sided = self.fetch(server, "/api/backtest", "POST",
+                               {"symbol": SYMBOL, "start": "2026-01-01"}, headers)
+        self.assertEqual(one_sided["code"], "BAD_WINDOW")
+        junk = self.fetch(server, "/api/backtest", "POST",
+                          {"symbol": SYMBOL, "start": "yesterday", "end": "today"},
+                          headers)
+        self.assertEqual(junk["code"], "BAD_DATE")
+        too_wide = self.fetch(server, "/api/backtest", "POST",
+                              {"symbol": SYMBOL, "start": "2020-01-01",
+                               "end": "2026-01-01"}, headers)
+        self.assertEqual(too_wide["code"], "BAD_WINDOW")
+
     def test_remote_mode_requires_access_code(self):
         server = TerminalServer(self.cfg, self.engine, host="0.0.0.0", port=0,
                                 quiet=True, access_code="test-code-123")
@@ -957,6 +1017,29 @@ class TestServer(BaseCase):
         self.fetch(server, "/api/mode", "POST", {"mode": "DISCONNECTED"}, headers)
         state = self.fetch(server, "/api/state", headers=headers)
         self.assertEqual(state["mode"], MODE_DISCONNECTED)
+
+
+class TestCliSurface(unittest.TestCase):
+    """The CLI must expose exactly the flags the docs claim."""
+
+    def test_backtest_accepts_date_window_and_label(self):
+        import meme_terminal as cli
+        parser = cli.build_parser()
+        args = parser.parse_args(["backtest", "BTCUSDT", "--start", "2026-01-01",
+                                  "--end", "2026-02-01", "--label", "v2"])
+        self.assertEqual((args.start, args.end, args.label),
+                         ("2026-01-01", "2026-02-01", "v2"))
+        train = parser.parse_args(["train", "ETHUSDT", "--label", "trend-v2"])
+        self.assertEqual(train.label, "trend-v2")
+
+    def test_globals_may_follow_the_subcommand(self):
+        import meme_terminal as cli
+        argv = cli.normalize_argv(["serve", "--port", "8791", "--demo"])
+        self.assertIn("serve", argv)
+        self.assertLess(argv.index("--port"), argv.index("serve"))
+        args = cli.build_parser().parse_args(argv)
+        self.assertEqual(args.port, 8791)
+        self.assertTrue(args.demo)
 
 
 # ---------------------------------------------------------------------------

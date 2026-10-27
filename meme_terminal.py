@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -41,7 +42,7 @@ from memeterm.binance import BinanceError                          # noqa: E402
 from memeterm.config import ConfigError, TerminalConfig            # noqa: E402
 from memeterm.engine import LIVE_CONFIRMATION, EngineError, TradingEngine  # noqa: E402
 from memeterm.server import TerminalServer                         # noqa: E402
-from memeterm.util import fmt_money, utc_str                       # noqa: E402
+from memeterm.util import fmt_money, parse_day_ms, utc_str          # noqa: E402
 
 
 BANNER = r"""
@@ -177,12 +178,34 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     cfg = build_config(args)
     engine = build_engine(cfg)
     symbol = (args.symbol or cfg.watchlist[0]).upper()
-    candles = collect_candles(engine.client, symbol, args.interval, args.bars)
+    start_raw = getattr(args, "start", None)
+    end_raw = getattr(args, "end", None)
+    start_ms = end_ms = None
+    if start_raw or end_raw:
+        if not (start_raw and end_raw):
+            print("--start and --end must be given together")
+            return 2
+        try:
+            start_ms = parse_day_ms(start_raw)
+            end_ms = parse_day_ms(end_raw)
+        except ValueError as exc:
+            print("bad date: {}".format(exc))
+            return 2
+        if end_ms <= start_ms:
+            print("--end must be after --start")
+            return 2
+        if end_ms - start_ms > 400 * 86_400_000:
+            print("range is longer than 400 days; narrow it")
+            return 2
+    candles = collect_candles(engine.client, symbol, args.interval, args.bars,
+                              start_ms=start_ms, end_ms=end_ms)
     if not candles:
         print("no historical candles returned for {} (offline or bad symbol)".format(symbol))
         return 2
+    label = re.sub(r"[^A-Za-z0-9._-]", "", str(getattr(args, "label", "") or ""))[:24]
     report = engine.backtester.run(candles, symbol=symbol, interval=args.interval,
-                                   horizon=args.horizon, persist=args.save)
+                                   horizon=args.horizon, persist=args.save,
+                                   label=label)
     if args.json:
         print_json(report)
         return 0 if report.get("ok") else 1
@@ -197,6 +220,9 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     print(" split: train {} / validation {} / test {} (chronological, embargo {})".format(
         report["bars"]["train"], report["bars"]["validation"], report["bars"]["test"],
         report["split"]["embargo_bars"]))
+    if start_ms:
+        print(" window: {} .. {}".format(utc_str(start_ms / 1000.0),
+                                        utc_str(end_ms / 1000.0)))
     print()
     print(" {:<26} {:>12} {:>12}".format("metric", "model", "baseline"))
     for label, key in [("net return %", "net_return_pct"), ("trades", "trades"),
@@ -332,6 +358,9 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--interval", default="15m")
     backtest.add_argument("--bars", type=int, default=1500)
     backtest.add_argument("--horizon", type=int, default=6)
+    backtest.add_argument("--start", help="window start, YYYY-MM-DD (needs --end)")
+    backtest.add_argument("--end", help="window end, YYYY-MM-DD (needs --start)")
+    backtest.add_argument("--label", help="short label appended to the saved model version")
     backtest.add_argument("--save", action="store_true", help="store the model version")
     backtest.set_defaults(func=cmd_backtest)
 
@@ -340,6 +369,9 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--interval", default="15m")
     train.add_argument("--bars", type=int, default=2000)
     train.add_argument("--horizon", type=int, default=6)
+    train.add_argument("--start", help="window start, YYYY-MM-DD (needs --end)")
+    train.add_argument("--end", help="window end, YYYY-MM-DD (needs --start)")
+    train.add_argument("--label", help="short label appended to the saved model version")
     train.add_argument("--save", action="store_true", default=True)
     train.set_defaults(func=cmd_backtest, save=True)
 

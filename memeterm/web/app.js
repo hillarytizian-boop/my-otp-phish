@@ -806,13 +806,21 @@ async function runBacktest(event) {
         symbol: $("#bt-symbol").value.trim().toUpperCase(),
         interval: $("#bt-interval").value,
         bars: parseInt($("#bt-bars").value, 10) || 1500,
+        start: $("#bt-start").value || null,
+        end: $("#bt-end").value || null,
+        label: $("#bt-label").value.trim(),
         save: $("#bt-save").checked,
       },
     });
     const report = data.report || {};
     if (!report.ok) throw new Error(report.error || "backtest failed");
     renderBacktest(report);
-    $("#bt-status").textContent = "done · " + report.bars.usable + " usable bars";
+    const window = report.window || {};
+    const span = window.start ? " · " + window.start.slice(0, 10) + " → " + window.end.slice(0, 10) : "";
+    const version = (report.model && report.model.version) ? " · model " + report.model.version : "";
+    $("#bt-status").textContent =
+      "done · " + report.bars.usable + " usable bars" + span + version;
+    if ($("#bt-save").checked) loadLatestModel().catch(() => {});
   } catch (error) {
     $("#bt-status").textContent = "";
     toast(error.message, "bad");
@@ -1006,12 +1014,41 @@ async function loadSymbols() {
 }
 
 /* ---------------------------------------------------------------- nav */
+async function loadLatestModel() {
+  const pill = $("#bt-latest-pill");
+  const text = $("#bt-latest");
+  if (!pill || !text) return;
+  try {
+    const data = await api("/api/backtest/latest");
+    if (!data.model) {
+      pill.textContent = "none";
+      pill.className = "pill";
+      text.textContent = "No saved model yet. A run is transient unless you tick " +
+        "\u201csave model version\u201d.";
+      return;
+    }
+    const report = data.report || {};
+    const metrics = report.metrics || {};
+    const trained = new Date((data.model.trained_at || 0) * 1000)
+      .toISOString().slice(0, 16).replace("T", " ");
+    pill.textContent = "latest";
+    pill.className = "pill ok";
+    text.textContent = data.model.version + " \u00b7 trained " + trained + " UTC \u00b7 " +
+      (metrics.trades || 0) + " holdout trades \u00b7 net " + pct(metrics.net_return_pct) +
+      " \u00b7 " + (metrics.sample_sufficient ? "sample ok" : "insufficient sample") +
+      " \u00b7 stored in models/, never used to enable live trading";
+  } catch (error) {
+    pill.textContent = "—";
+  }
+}
+
 function showPage(name) {
   $$(".page").forEach((page) => page.classList.toggle("active", page.id === "page-" + name));
   $$(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.page === name));
   $$(".bottom-nav button").forEach((button) =>
     button.classList.toggle("active", button.dataset.page === name));
   if (name === "settings") loadAudit().catch(() => {});
+  if (name === "backtest") loadLatestModel().catch(() => {});
   if (name === "dashboard") setTimeout(() => S.market && drawChart(S.market), 30);
 }
 

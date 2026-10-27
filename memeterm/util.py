@@ -8,6 +8,7 @@ can reach a log file, an API response or the browser.
 
 from __future__ import annotations
 
+import calendar
 import json
 import math
 import os
@@ -171,6 +172,29 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 def bps(value: float) -> float:
     """basis points -> fraction"""
     return float(value) / 10_000.0
+
+
+def parse_day_ms(value: Any) -> Optional[int]:
+    """Parse "YYYY-MM-DD" (or an epoch seconds/ms string) into epoch milliseconds.
+
+    Used by the backtest date-range form. Raises ValueError for anything else so
+    the HTTP layer can return a clear 400 instead of silently ignoring a typo.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        number = int(text)
+        return number * 1000 if number < 10_000_000_000 else number
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            parsed = time.strptime(text, fmt)
+        except ValueError:
+            continue
+        return int(calendar.timegm(parsed) * 1000)
+    raise ValueError("expected a date like 2026-01-31, got {!r}".format(text[:20]))
 
 
 def iso_age(ts: Optional[float]) -> str:

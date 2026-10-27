@@ -46,11 +46,21 @@ MIN_TEST_TRADES = 30
 # data
 # ---------------------------------------------------------------------------
 def collect_candles(client: BinanceClient, symbol: str, interval: str = "15m",
-                    bars: int = 3000) -> List[Dict[str, float]]:
-    """Page backwards until we have `bars` candles (max 1000 per call)."""
+                    bars: int = 3000, start_ms: Optional[int] = None,
+                    end_ms: Optional[int] = None) -> List[Dict[str, float]]:
+    """Page backwards until we have `bars` candles (max 1000 per call).
+
+    When `start_ms`/`end_ms` are given the window wins: the number of bars is
+    derived from the range (clamped to 5000) and anything older than
+    `start_ms` is dropped, so a date-range request returns exactly that
+    window instead of "the most recent N bars".
+    """
     step = INTERVAL_MS.get(interval, 900_000)
+    if start_ms and end_ms and end_ms > start_ms:
+        span = int((end_ms - start_ms) // step) + 1
+        bars = max(50, min(5000, span))
     out: List[List[Any]] = []
-    end_time = None
+    end_time = int(end_ms) if end_ms else None
     remaining = max(1, int(bars))
     while remaining > 0:
         limit = min(1000, remaining)
@@ -58,10 +68,14 @@ def collect_candles(client: BinanceClient, symbol: str, interval: str = "15m",
                              end_ms=end_time)
         if not rows:
             break
+        if start_ms:
+            rows = [row for row in rows if int(row[0]) >= int(start_ms)]
+            if not rows:
+                break
         out = rows + out
         remaining -= len(rows)
         end_time = int(rows[0][0]) - 1
-        if len(rows) < limit:
+        if len(rows) < limit or (start_ms and end_time < int(start_ms)):
             break
         time.sleep(0.15)                     # be a good citizen about weight
     # dedupe by open time, keep order
@@ -72,6 +86,8 @@ def collect_candles(client: BinanceClient, symbol: str, interval: str = "15m",
             continue
         seen.add(int(row[0]))
         clean.append(row)
+    if start_ms:
+        clean = [row for row in clean if int(row[0]) >= int(start_ms)]
     return parse_klines(clean[-bars:]) if bars else parse_klines(clean)
 
 
@@ -401,7 +417,7 @@ class Backtester:
     # -- main ----------------------------------------------------------
     def run(self, candles: List[Dict[str, float]], *, symbol: str, interval: str,
             horizon: int = 6, train_frac: float = 0.6, val_frac: float = 0.2,
-            persist: bool = False) -> Dict[str, Any]:
+            persist: bool = False, label: str = "") -> Dict[str, Any]:
         dataset = build_dataset(candles, horizon=horizon, fee_bps=self.fee_bps,
                                 slippage_bps=self.slippage_bps)
         rows = dataset["rows"]
@@ -507,6 +523,8 @@ class Backtester:
         if persist:
             version = "{}-{}-{}".format(symbol.upper(), interval,
                                         time.strftime("%Y%m%d-%H%M%S"))
+            if label:
+                version = "{}-{}".format(version, label)
             report["model"]["version"] = version
             path = self.save_model(version, model, report)
             report["model"]["path"] = path

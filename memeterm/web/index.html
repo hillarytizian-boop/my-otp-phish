@@ -305,6 +305,22 @@
           <input id="bt-bars" type="number" min="300" max="5000" step="100" value="1500">
         </div>
       </div>
+      <div class="grid three">
+        <div>
+          <label for="bt-start">From <span class="hint">(optional)</span></label>
+          <input id="bt-start" type="date">
+        </div>
+        <div>
+          <label for="bt-end">To <span class="hint">(optional)</span></label>
+          <input id="bt-end" type="date">
+        </div>
+        <div>
+          <label for="bt-label">Version label</label>
+          <input id="bt-label" maxlength="24" placeholder="e.g. trend-v2" spellcheck="false">
+        </div>
+      </div>
+      <p class="hint">A date range overrides <em>Bars</em>; maximum span is 400 days.
+        Leave both blank to use the most recent bars.</p>
       <div class="row">
         <button class="btn primary" type="submit">Run backtest</button>
         <label class="check"><input type="checkbox" id="bt-save"> save model version</label>
@@ -321,6 +337,14 @@
         <tbody></tbody>
       </table>
       <p class="hint" id="bt-honesty"></p>
+    </div>
+
+    <div class="card" id="bt-latest-card">
+      <div class="card-head"><h3>Saved model versions</h3>
+        <span class="pill" id="bt-latest-pill">none</span></div>
+      <p class="hint" id="bt-latest">No saved model yet. A run is transient unless you tick
+        &ldquo;save model version&rdquo;. Saved models are stored with their report and are
+        never used to enable live trading.</p>
     </div>
   </section>
 
