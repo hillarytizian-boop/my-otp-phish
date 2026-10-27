@@ -1,1 +1,19 @@
-node_modules
+# runtime artifacts produced by meme_agents.py
+trades.csv
+bot.log
+bot.log.*
+final_report.txt
+free_run_report.txt
+state.json
+state.json.tmp
+heartbeat.json
+heartbeat.json.tmp
+trades.*.csv
+STOP
+.env
+.env.*
+!.env.example
+signals.json
+signals.json.tmp
+__pycache__/
+*.pyc
