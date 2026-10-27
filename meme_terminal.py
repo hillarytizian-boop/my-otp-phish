@@ -172,7 +172,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
     remote = cfg.host not in ("127.0.0.1", "localhost", "::1")
     server = TerminalServer(cfg, engine, host=cfg.host, port=cfg.port,
                             quiet=bool(getattr(args, "quiet", False)))
-    url = server.start()
+    try:
+        url = server.start()
+    except OSError as exc:
+        print("cannot bind {}:{} - {}".format(cfg.host, cfg.port, exc))
+        print("another program is already using that port; try --port {}".format(
+            int(cfg.port) + 1))
+        return 2
     engine.start_background()
 
     print(BANNER)

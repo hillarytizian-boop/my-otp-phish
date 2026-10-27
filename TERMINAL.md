@@ -39,7 +39,7 @@ pkg update && pkg upgrade -y
 pkg install -y python
 cd ~/my-otp-phish          # the cloned repository
 python meme_terminal.py --version
-python meme_terminal.py selftest      # 67 offline tests, no network, ~9 s
+python meme_terminal.py selftest      # 68 offline tests, no network, ~9 s
 ```
 
 No pip packages, no compiler, no `solders`. The browser UI is three static files
@@ -353,7 +353,7 @@ memeterm/
   demo.py               synthetic data for offline evaluation (cannot trade)
   universe.py           which symbols are tradable/liquid enough to train on
   web/                  index.html, app.js, styles.css (no build step)
-tests/test_memeterm.py  67 offline tests
+tests/test_memeterm.py  68 offline tests
 ```
 
 ## 12. Warning

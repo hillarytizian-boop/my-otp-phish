@@ -1118,6 +1118,25 @@ class TestCliSurface(unittest.TestCase):
         self.assertEqual(cli.terminal_url(cfg.copy(host="127.0.0.1", port=8787)),
                          "http://127.0.0.1:8787")
 
+    def test_busy_port_fails_cleanly(self):
+        import contextlib
+        import io
+        import socket
+        import meme_terminal as cli
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        port = sock.getsockname()[1]
+        try:
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                code = cli.main(["serve", "--port", str(port),
+                                 "--data-dir", tempfile.mkdtemp()])
+            self.assertEqual(code, 2)
+            self.assertIn("already using that port", buffer.getvalue())
+        finally:
+            sock.close()
+
     def test_train_suite_runs_offline_in_demo_mode(self):
         import contextlib
         import io
