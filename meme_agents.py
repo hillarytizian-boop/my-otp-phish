@@ -272,6 +272,23 @@ def fmt_usd(x: float, places: int = 2) -> str:
         return "?"
 
 
+def fmt_price(x: Optional[float]) -> str:
+    """Readable price for sub-cent meme tokens: 4 sig figs, no exponent."""
+    if x is None:
+        return "?"
+    try:
+        if x <= 0:
+            return "?"
+        if x >= 0.01:
+            return "{:.6g}".format(x)
+        if x < 1e-9:                      # absurdly small; keep exponent
+            return "{:.4g}".format(x)
+        digits = min(12, max(4, int(-math.floor(math.log10(x))) + 4))
+        return "{:.{}f}".format(x, digits).rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return "?"
+
+
 def fmt_pct(x: float) -> str:
     return "{:+.1f}%".format(x)
 
@@ -3057,8 +3074,8 @@ class Signal:
             out.append(row("", "WARNING: not a valid Solana mint address"))
         if self.name:
             out.append(row("name", self.name))
-        out.append(row("price", "${:.10g}  ({:.0f}s old)".format(
-            self.price, self.data_age_s_now(now))))
+        out.append(row("price", "${}  ({:.0f}s old)".format(
+            fmt_price(self.price), self.data_age_s_now(now))))
         out.append(row("FDV", "{}   LIQ {}".format(
             fmt_usd(self.fdv_usd) if self.fdv_usd else "n/a", fmt_usd(self.liquidity_usd))))
         out.append(row("5m", "{}   vol {}".format(fmt_pct(self.change_5m),
@@ -3088,14 +3105,14 @@ class Signal:
             out.append(row("reject", "; ".join(self.reject_reasons[:2])))
         out.append(line)
         if self.price > 0:
-            out.append(row("ENTRY", "${:.10g} - ${:.10g}".format(self.entry_low,
-                                                                self.entry_high)))
-            out.append(row("INVAL", "${:.10g}  (-{:.0f}% stop rule)".format(
-                self.invalidation, self.cfg_stop_pct)))
-            out.append(row("TP1", "${:.10g}  (+{:.0f}%, sell {:.0f}%)".format(
-                self.target_1, self.cfg_tp1_pct, self.cfg_tp1_frac * 100)))
-            out.append(row("TP2", "${:.10g}  (+{:.0f}%, sell {:.0f}%)".format(
-                self.target_2, self.cfg_tp2_pct, self.cfg_tp2_frac * 100)))
+            out.append(row("ENTRY", "${} - ${}".format(fmt_price(self.entry_low),
+                                                       fmt_price(self.entry_high))))
+            out.append(row("INVAL", "${}  (-{:.0f}% stop rule)".format(
+                fmt_price(self.invalidation), self.cfg_stop_pct)))
+            out.append(row("TP1", "${}  (+{:.0f}%, sell {:.0f}%)".format(
+                fmt_price(self.target_1), self.cfg_tp1_pct, self.cfg_tp1_frac * 100)))
+            out.append(row("TP2", "${}  (+{:.0f}%, sell {:.0f}%)".format(
+                fmt_price(self.target_2), self.cfg_tp2_pct, self.cfg_tp2_frac * 100)))
             out.append(row("R:R", "{:.1f} : 1 to TP1 (before fees/slippage)".format(self.rr)))
         else:
             out.append(row("ENTRY", "n/a (no price)"))
@@ -3126,7 +3143,8 @@ class Signal:
             "[{}] {}".format(kind, self.symbol or short_addr(self.mint)),
             "mint: {}".format(self.mint),
             "score: {:.0f}/100".format(self.score),
-            "price: ${:.10g}  ({} ago)".format(self.price, _ago(self.data_age_s_now(now))),
+            "price: ${}  ({} ago)".format(fmt_price(self.price),
+                                          _ago(self.data_age_s_now(now))),
             "FDV: {}   liquidity: {}".format(
                 fmt_usd(self.fdv_usd) if self.fdv_usd else "n/a", fmt_usd(self.liquidity_usd)),
             "5m: {}  vol {}   |   1h: {}  vol {}".format(
@@ -3152,11 +3170,13 @@ class Signal:
             rows.append("rejected: " + "; ".join(self.reject_reasons[:3]))
         if self.price > 0:
             rows += [
-                "entry idea: ${:.10g} - ${:.10g}".format(self.entry_low, self.entry_high),
-                "invalidation: ${:.10g} (-{:.0f}%)".format(self.invalidation,
+                "entry idea: ${} - ${}".format(fmt_price(self.entry_low),
+                                                fmt_price(self.entry_high)),
+                "invalidation: ${} (-{:.0f}%)".format(fmt_price(self.invalidation),
                                                            self.cfg_stop_pct),
-                "targets: ${:.10g} (+{:.0f}%) / ${:.10g} (+{:.0f}%)".format(
-                    self.target_1, self.cfg_tp1_pct, self.target_2, self.cfg_tp2_pct),
+                "targets: ${} (+{:.0f}%) / ${} (+{:.0f}%)".format(
+                    fmt_price(self.target_1), self.cfg_tp1_pct,
+                    fmt_price(self.target_2), self.cfg_tp2_pct),
                 "R:R {:.1f}:1 to TP1 before fees".format(self.rr),
             ]
         rows += [
@@ -6208,6 +6228,18 @@ def run_selftest() -> int:
     old_snap.ts = time.time() - 300          # a quote that is five minutes old
     aged = build_signal(cfg, GOOD, old_snap, _mk_facts(GOOD), fat_tape,
                         momentum_score(old_snap, fat_tape, cfg), None, now=time.time())
+    _tg = good_sig.telegram()
+    _want = "entry idea: ${} - ${}".format(fmt_price(good_sig.entry_low),
+                                           fmt_price(good_sig.entry_high))
+    check("telegram: card text has no exponent notation for prices",
+          _want in _tg and "e-0" not in _tg,
+          [ln for ln in _tg.splitlines() if ln.startswith("entry idea")][0][:44])
+
+    check("format: sub-cent prices print as decimals, never as 1.2e-05",
+          fmt_price(0.0000123) == "0.0000123" and fmt_price(4.2e-08) == "0.000000042"
+          and fmt_price(0.5) == "0.5" and fmt_price(None) == "?",
+          "{} / {}".format(fmt_price(0.0000123), fmt_price(4.2e-08)))
+
     check("signal: data age is reported, not hidden",
           aged.data_age_s_now() >= 295 and "300s old" in aged.card(),
           "{:.0f}s age, card says {}".format(aged.data_age_s_now(),

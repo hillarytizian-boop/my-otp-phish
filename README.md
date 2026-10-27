@@ -237,7 +237,7 @@ positions, prints a summary and exits cleanly.
 python meme_agents.py --selftest
 ```
 
-Runs 148 assertions: every safety filter, copycat/name and tape-quality gates, the
+Runs 150 assertions: every safety filter, copycat/name and tape-quality gates, the
 second-look confirmation, momentum scoring, the full exit ladder
 (stop-loss, +100 %/+300 % take-profits, 15 %/10 % trailing, time stop, all three
 emergencies), paper fill maths, the live execution path against a fake `solders` +
@@ -321,17 +321,26 @@ Example (shortened rows, real layout is 58 columns wide):
 | CONFIRMED $BONK2 score 84                              |
 | ------------------------------------------------------ |
 | mint 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU      |
+| name Bonk Two                                          |
 | price $0.0000123 (2s old)                              |
-| FDV $12.4M LIQ $210.0K                                 |
+| FDV $12.40M LIQ $210.0K                                |
 | 5m +8.2% vol $42.1K                                    |
+| 1h +31.0% vol $180.0K                                  |
 | tape 24 buys / 9 sells (18 buyers)                     |
+| why buyer growth 100 buy vol pressure 100 vol accel 90 |
 | ------------------------------------------------------ |
 | safety 18 checks passed                                |
+| audit top10 21.0% | LP 100% lock | auth revoked        |
+| ------------------------------------------------------ |
 | ENTRY $0.0000119 - $0.0000124                          |
 | INVAL $0.00000984 (-20% stop rule)                     |
 | TP1 $0.0000246 (+100%, sell 50%)                       |
 | TP2 $0.0000492 (+300%, sell 25%)                       |
 | R:R 5.0 : 1 to TP1 (before fees/slippage)              |
+| ------------------------------------------------------ |
+| assume paper fills | 3% slip | $0.34 fees/RT           |
+| src dexscreener+geckoterminal+geckoterminal:tape+ru... |
+| asof 2026-10-27T13:13:29Z                              |
 +--------------------------------------------------------+
 | PAPER MODE - RESEARCH ONLY, NO REAL TRADE              |
 +--------------------------------------------------------+
@@ -402,6 +411,31 @@ python meme_agents.py --watch --refresh 120
 Only **CONFIRMED** and **INVALIDATED** signals are pushed, each at most once per
 `telegram_signal_cooldown_s` (default 30 min) per mint and status — a refresh loop will
 not spam you. Every message ends with `PAPER MODE - NO REAL TRADE EXECUTED`.
+
+What a message looks like (rendered from the same `Signal` object the terminal card
+uses; values from a mocked feed):
+
+```
+[CONFIRMED SIGNAL] BONK2
+mint: 7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU
+score: 84/100
+price: $0.0000123  (2s ago)
+FDV: $12.40M   liquidity: $210.0K
+5m: +8.2%  vol $42.1K   |   1h: +31.0%  vol $180.0K
+tape: 24 buys / 9 sells
+safety: 18 checks passed (top10 21.0% | LP 100% lock | auth revoked)
+entry idea: $0.0000119 - $0.0000124
+invalidation: $0.00000984 (-20%)
+targets: $0.0000246 (+100%) / $0.0000492 (+300%)
+R:R 5.0:1 to TP1 before fees
+sources: dexscreener+geckoterminal+geckoterminal:tape+rugcheck
+assumptions: paper fills, 3% entry-slip cap, ~$0.34 fixed fees per
+round trip at $2 size, no MEV/failed-tx modelling
+data age: 2s  |  asof 2026-10-27T13:13:29Z
+
+PAPER MODE - NO REAL TRADE EXECUTED
+Not financial advice. Entry/stop/targets are arithmetic from the
+configured exit rules, not predictions. Most meme coins go to zero.```
 
 Safe test procedure, in order:
 
